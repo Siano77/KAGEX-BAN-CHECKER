@@ -91,6 +91,19 @@ def parse_numbers(text: str) -> list:
     return out[:MAX_NUM]
 
 
+def mask_number(display: str) -> str:
+    """Mask middle digits for privacy: +2348078443988 → +234*****988"""
+    digits = display.lstrip('+')
+    if len(digits) <= 6:
+        return display
+    keep_start = max(4, len(digits) - 9)
+    keep_end   = 3
+    n_stars    = len(digits) - keep_start - keep_end
+    if n_stars < 2:
+        return display
+    return f"+{digits[:keep_start]}{'*' * n_stars}{digits[-keep_end:]}"
+
+
 # ════════════════════════════════════════════════
 #  BARON0 BANCHECK API  —  PRIMARY
 # ════════════════════════════════════════════════
@@ -437,63 +450,68 @@ async def check_all(numbers: list) -> list:
 #  FORMATTERS
 # ════════════════════════════════════════════════
 
-STATUS_LBL = {
-    "active":         ("🟢", "ACTIVE — Not Banned"),
-    "banned":         ("🔴", "BANNED"),
-    "not_registered": ("⚫", "NOT ON WHATSAPP"),
-    "rate_limited":   ("⏳", "RATE LIMITED"),
-    "server_blocked": ("🟠", "IP BLOCKED BY WA"),
-    "timeout":        ("🟡", "TIMEOUT"),
-    "error":          ("❌", "ERROR"),
-    "unknown":        ("❓", "UNKNOWN"),
+# ── Status & ban display maps ────────────────────────────────────────────────
+STATUS_DISPLAY = {
+    "active":         ("🟢", "✦ ALIVE  —  NOT BANNED 🔥"),
+    "banned":         ("🔴", "💀 BANNED  —  SHADOW CAUGHT"),
+    "not_registered": ("👻", "⚫ GHOST  —  NOT ON WHATSAPP"),
+    "rate_limited":   ("⏳", "⌛ RATE LIMITED — RETRY SOON"),
+    "server_blocked": ("🌑", "🌑 SHADOW WALL — IP RESTRICTED"),
+    "timeout":        ("🕐", "🕐 TIMEOUT — NO ECHO"),
+    "error":          ("💢", "💢 SYSTEM ERROR"),
+    "unknown":        ("🌀", "🌀 UNKNOWN — SIGNAL LOST"),
 }
-BAN_LBL = {
-    "Admin":    "👮 Admin Ban",
-    "Regional": "🌍 Regional Ban",
-    "Personal": "🔒 Personal Ban",
+BAN_DISPLAY = {
+    "Admin":    "👮 Admin Shadow",
+    "Regional": "🌍 Regional Shadow",
+    "Personal": "🔒 Personal Shadow",
 }
 
 
 def build_msg(results, elapsed, requester):
-    now    = datetime.now().strftime("%d %b %Y  %H:%M:%S")
     total  = len(results)
     banned = sum(1 for r in results if r["status"] == "banned")
     active = sum(1 for r in results if r["status"] == "active")
     other  = total - banned - active
-    div    = "─" * 36
+    now    = datetime.now().strftime("%d %b %Y · %H:%M:%S")
+    div    = "━" * 30
 
     lines = [
-        "╔" + "═" * 38 + "╗",
-        "║   ⚡  <b>KAGE X Ban Checker</b>  ⚡  v8.0  ║",
-        f"║   🗓 {now:<31}║",
-        "╚" + "═" * 38 + "╝",
+        "👁  <b>K A G E  X  B A N  C H E C K E R</b>  👁",
+        f"<i>🕐 {now}</i>",
         "",
-        "📊 <b>Summary</b>",
-        f"   • Total    : <code>{total}</code>",
-        f"   • 🔴 Banned  : <code>{banned}</code>",
-        f"   • 🟢 Active  : <code>{active}</code>",
-        f"   • Other    : <code>{other}</code>",
-        f"   • ⏱ Speed   : <code>{elapsed:.2f}s</code>",
-        "", div, "",
+        "<b>🌑 Shadow Report</b>",
+        f"  ⚡ Checked  : <code>{total}</code>",
+        f"  💀 Banned   : <code>{banned}</code>",
+        f"  🟢 Alive    : <code>{active}</code>",
+        f"  🌀 Other    : <code>{other}</code>",
+        f"  🏎 Speed    : <code>{elapsed:.2f}s</code>",
+        "",
+        div,
+        "",
     ]
 
     for i, r in enumerate(results, 1):
-        icon, lbl = STATUS_LBL.get(r["status"], ("❓", r["status"].upper()))
-        bt  = BAN_LBL.get(r.get("ban_type"), "") if r.get("ban_type") else ""
-        src = r.get("source", "")
-        note = r.get("note", "")
+        icon, lbl = STATUS_DISPLAY.get(r["status"], ("🌀", r["status"].upper()))
+        masked    = mask_number(r["display"])
+        bt        = BAN_DISPLAY.get(r.get("ban_type"), "") if r.get("ban_type") else "—"
+        src       = r.get("source", "KAGE X API")
+        note      = r.get("note", "")
 
-        lines.append(f"<b>#{i}</b>  {icon}  <code>{r['display']}</code>")
-        lines.append(f"      Status   : <b>{lbl}</b>")
-        if bt:
-            lines.append(f"      Ban Type : <b>{bt}</b>")
-        lines.append(f"      Ping     : <code>{r['ping_ms']} ms</code>")
-        lines.append(f"      Source   : <i>{src}</i>")
+        lines.append(f"<b>[ #{i} ]</b>")
+        lines.append(f"📱 <b>Number</b>   : <code>{masked}</code>")
+        lines.append(f"{icon} <b>Status</b>    : <b>{lbl}</b>")
+        lines.append(f"🛡 <b>Ban Type</b>  : {bt}")
+        lines.append(f"⏱ <b>Ping</b>      : <code>{r['ping_ms']} ms</code>")
+        lines.append(f"📡 <b>API</b>       : <i>{src}</i>")
         if note and note not in ("(fallback)", ""):
-            lines.append(f"      Reason   : <i>{note}</i>")
+            lines.append(f"🩸 <b>Reason</b>    : <i>{note}</i>")
         lines.append("")
 
-    lines += [div, f"👤 By: <b>{requester}</b>  |  🤖 <b>{BOT_NAME}</b>"]
+    lines += [
+        div,
+        f"  👤 <b>{requester}</b>  ·  💀 <b>K A G E  X</b> 💀",
+    ]
     return "\n".join(lines)
 
 
@@ -503,28 +521,35 @@ def build_msg(results, elapsed, requester):
 
 async def cmd_start(u: Update, _):
     name = u.effective_user.first_name
-    msg  = (
-        "╔" + "═" * 38 + "╗\n"
-        "║   ⚡  <b>KAGE X Ban Checker</b>  ⚡  v8.0  ║\n"
-        "╚" + "═" * 38 + "╝\n\n"
-        f"👋 Welcome, <b>{name}</b>!\n\n"
-        "🔵 <b>Primary: baron0.com BanCheck API</b>\n"
-        "🔄 Fallback: 5-method engine\n\n"
-        "<b>Results:</b>\n"
-        "  🟢 Active  •  🔴 Banned  •  ⚫ Not Registered\n"
-        "  Ban types: 🔒 Personal  🌍 Regional  👮 Admin\n\n"
-        "━" * 26 + "\n"
+
+    welcome = (
+        "👁  <b>K A G E  X  B A N  C H E C K E R</b>  👁\n"
+        "<i>— We see through every shadow —</i>\n\n"
+        f"⚡ Welcome back, <b>{name}</b>. The dark scanner is online.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🌑 <b>What we expose:</b>\n"
+        "   🟢 <b>Alive</b>   — Active &amp; roaming free\n"
+        "   💀 <b>Banned</b>  — Caught in the shadow\n"
+        "   👻 <b>Ghost</b>   — Never existed on WA\n\n"
+        "🩸 <b>Shadow types detected:</b>\n"
+        "   🔒 Personal  ·  🌍 Regional  ·  👮 Admin\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<b>Send numbers like this:</b>\n"
         "  <code>!check +2348012345678</code>\n"
-        "  <code>!check 234xxx 447xxx 155xxx</code>\n"
-        "  <code>!testapi</code>  │  <code>!ping</code>\n"
-        "━" * 26
+        "  <code>!check 234xxx 447xxx 155xxx</code>\n\n"
+        "💀 <b>K A G E  X</b>  ·  <i>The shadow never lies.</i>"
     )
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("📖 Help",    callback_data="help"),
-        InlineKeyboardButton("ℹ️ About",   callback_data="about"),
-        InlineKeyboardButton("🔌 API Test", callback_data="testapi"),
-    ]])
-    await u.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔍 How To Check", callback_data="help"),
+            InlineKeyboardButton("📡 API Status",   callback_data="testapi"),
+        ],
+        [
+            InlineKeyboardButton("💀 About KAGE X", callback_data="about"),
+        ],
+    ])
+    await u.message.reply_text(welcome, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 async def cmd_help(u: Update, _):
@@ -610,7 +635,7 @@ async def cmd_check(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     wait = await u.message.reply_text(
-        f"⏳ Checking <code>{len(nums)}</code> number(s) via ⚡ KAGE X API... 🔍",
+        f"🌑 <b>Scanning</b> <code>{len(nums)}</code> number(s) through the shadow... ⚡",
         parse_mode=ParseMode.HTML,
     )
     t0      = time.monotonic()
@@ -618,8 +643,16 @@ async def cmd_check(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elapsed = time.monotonic() - t0
     req     = f"@{user.username}" if user.username else user.first_name
     await wait.delete()
-    await u.message.reply_text(build_msg(results, elapsed, req),
-                               parse_mode=ParseMode.HTML)
+
+    result_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 CHECK ANOTHER", callback_data="check_another"),
+        InlineKeyboardButton("📞 CONTACT",       url="https://t.me/"),
+    ]])
+    await u.message.reply_text(
+        build_msg(results, elapsed, req),
+        parse_mode=ParseMode.HTML,
+        reply_markup=result_kb,
+    )
 
 
 async def on_prefix(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -641,6 +674,14 @@ async def on_prefix(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def on_cb(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
+    if q.data == "check_another":
+        await q.message.reply_text(
+            "⚡ <b>Send your next number(s):</b>\n\n"
+            "  <code>!check +2348012345678</code>\n"
+            "  <code>!check 234xxx 447xxx 155xxx</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
     fn = {"help": cmd_help, "about": cmd_about, "testapi": cmd_testapi}.get(q.data)
     if fn: await fn(u, ctx)
 
