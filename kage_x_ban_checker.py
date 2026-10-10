@@ -38,7 +38,28 @@ BANCHECK_KEY = os.getenv(
     "G6PkZN8gLZakTSt_wMNupOBg9n47FWeQ9SqYxrCz5KXO3TLlRZeSYP"
 )
 BARON_URL   = "https://baron0.com/api/v2/check"  # confirmed endpoint
-BOT_BANNER  = os.getenv("BOT_BANNER", "")  # Telegram file_id or image URL for banner
+OWNER_ID    = int(os.getenv("OWNER_ID", "0"))   # set to YOUR Telegram user ID in Railway
+BOT_BANNER   = os.getenv("BOT_BANNER", "")  # optional env-var fallback
+BANNER_FILE  = "banner.txt"                 # persists banner file_id across restarts
+
+# ── Runtime banner state (updated by !setbanner without restart) ──────────────
+def _load_banner() -> str:
+    try:
+        txt = open(BANNER_FILE).read().strip()
+        if txt: return txt
+    except FileNotFoundError:
+        pass
+    return BOT_BANNER
+
+_banner: list = [_load_banner()]   # list so inner functions can mutate it
+
+def get_banner() -> str:  return _banner[0]
+def set_banner(fid: str) -> None:
+    _banner[0] = fid
+    try:
+        open(BANNER_FILE, "w").write(fid)
+    except Exception as e:
+        print(f"[BANNER SAVE ERROR] {e}")
 
 
 # ════════════════════════════════════════════════
@@ -93,13 +114,48 @@ def parse_numbers(text: str) -> list:
 
 
 async def send_banner(target) -> None:
-    """Send the banner image before any command response. Silently skips if not set."""
-    if not BOT_BANNER:
+    """Send banner image. Logs real errors; never crashes a command."""
+    fid = get_banner()
+    if not fid:
         return
     try:
-        await target.reply_photo(BOT_BANNER)
-    except Exception:
-        pass  # never crash a command just because the banner failed
+        await target.reply_photo(fid)
+    except Exception as e:
+        print(f"[BANNER ERROR] {type(e).__name__}: {e}")
+
+
+async def cmd_setbanner(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """!setbanner — owner-only: send as photo caption to set the banner image."""
+    msg = u.message or u.effective_message
+    # Block non-owners
+    if OWNER_ID and u.effective_user.id != OWNER_ID:
+        await msg.reply_text(
+            "🚫 <b>Owner only.</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    # Called with no photo (text-only !setbanner) → show instructions
+    if not u.message or not u.message.photo:
+        await (msg or u.effective_message).reply_text(
+            "📸 <b>How to set your KAGE X banner:</b>\n\n"
+            "1️⃣  Tap the 📎 attachment icon\n"
+            "2️⃣  Pick your image\n"
+            "3️⃣  <b>Type as caption:</b> <code>!setbanner</code>\n"
+            "4️⃣  Send it to this bot\n\n"
+            "✅ Done — banner will show on every command instantly.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    # Photo received — grab highest-quality variant
+    fid = msg.photo[-1].file_id
+    set_banner(fid)
+    print(f"[BANNER SET] file_id={fid}")
+    await msg.reply_text(
+        "✅ <b>Banner saved!</b>\n\n"
+        "Your image will now appear before every command.\n"
+        f"<i>file_id: <code>{fid[:40]}...</code></i>",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 def mask_number(display: str) -> str:
@@ -684,7 +740,8 @@ async def on_prefix(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cmd      = parts[0].lower() if parts else ""
     ctx.args = parts[1].split() if len(parts) > 1 else []
     fn = {"check": cmd_check, "start": cmd_start, "help": cmd_help,
-          "about": cmd_about, "ping": cmd_ping, "testapi": cmd_testapi}.get(cmd)
+          "about": cmd_about, "ping": cmd_ping, "testapi": cmd_testapi,
+          "setbanner": cmd_setbanner}.get(cmd)
     if fn:
         await fn(u, ctx)
     else:
@@ -713,7 +770,7 @@ async def on_err(update, ctx): print(f"[ERR] {ctx.error}")
 
 # ════════════════════════════════════════════════
 #  MAIN
-# ════════════════════════════════════════════════
+# ══════════════════════════��═════════════════════
 
 def main():
     token = BOT_TOKEN.strip()
@@ -725,6 +782,11 @@ def main():
                  ("ping", cmd_ping), ("check", cmd_check), ("testapi", cmd_testapi)]:
         app.add_handler(CommandHandler(c, f))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_prefix))
+    # Photo with !setbanner caption → set the banner image
+    app.add_handler(MessageHandler(
+        filters.PHOTO & filters.CaptionRegex(r"(?i)^!setbanner"),
+        cmd_setbanner,
+    ))
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_error_handler(on_err)
 
