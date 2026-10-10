@@ -399,7 +399,7 @@ async def check_one(session: aiohttp.ClientSession, digits: str) -> dict:
             "ban_type": api.get("ban_type"),
             "ping_ms":  ping_ms,
             "note":     api.get("note", ""),
-            "source":   "🔵 baron0 API",
+            "source":   "⚡ KAGE X API",
         }
 
     # 2. Fallback engine
@@ -411,7 +411,7 @@ async def check_one(session: aiohttp.ClientSession, digits: str) -> dict:
         "ban_type": fb.get("ban_type"),
         "ping_ms":  ping_ms,
         "note":     fb.get("note", ""),
-        "source":   "🟡 5-method fallback",
+        "source":   "🔄 KAGE X Engine",
     }
 
 
@@ -610,7 +610,7 @@ async def cmd_check(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     wait = await u.message.reply_text(
-        f"⏳ Checking <code>{len(nums)}</code> number(s) via baron0 API... ✨",
+        f"⏳ Checking <code>{len(nums)}</code> number(s) via ⚡ KAGE X API... 🔍",
         parse_mode=ParseMode.HTML,
     )
     t0      = time.monotonic()
