@@ -37,7 +37,8 @@ BANCHECK_KEY = os.getenv(
     "AWZwe6LaRXsCz8rsmA_VpilvBegFx9iUsRrGrfcXFKPZ364qEpiU0R3p-a1-9zyGYdiv"
     "G6PkZN8gLZakTSt_wMNupOBg9n47FWeQ9SqYxrCz5KXO3TLlRZeSYP"
 )
-BARON_URL = "https://baron0.com/api/v2/check"  # confirmed endpoint
+BARON_URL   = "https://baron0.com/api/v2/check"  # confirmed endpoint
+BOT_BANNER  = os.getenv("BOT_BANNER", "")  # Telegram file_id or image URL for banner
 
 
 # ════════════════════════════════════════════════
@@ -89,6 +90,16 @@ def parse_numbers(text: str) -> list:
         if 7 <= len(d) <= 15 and d not in seen:
             seen.add(d); out.append(d)
     return out[:MAX_NUM]
+
+
+async def send_banner(target) -> None:
+    """Send the banner image before any command response. Silently skips if not set."""
+    if not BOT_BANNER:
+        return
+    try:
+        await target.reply_photo(BOT_BANNER)
+    except Exception:
+        pass  # never crash a command just because the banner failed
 
 
 def mask_number(display: str) -> str:
@@ -521,6 +532,7 @@ def build_msg(results, elapsed, requester):
 
 async def cmd_start(u: Update, _):
     name = u.effective_user.first_name
+    await send_banner(u.message)
 
     welcome = (
         "👁  <b>K A G E  X  B A N  C H E C K E R</b>  👁\n"
@@ -553,65 +565,74 @@ async def cmd_start(u: Update, _):
 
 
 async def cmd_help(u: Update, _):
+    t = u.message or u.callback_query.message
+    await send_banner(t)
     msg = (
         "⚡ <b>KAGE X — Commands</b>\n\n"
-        "<code>!check +234xxxxxxxx</code> — single\n"
-        "<code>!check 234xxx 447xxx</code> — multi\n"
-        "<code>!testapi</code> — test baron0 API\n"
+        "<code>!check +234xxxxxxxx</code> — single check\n"
+        "<code>!check 234xxx 447xxx</code> — multi check\n"
+        "<code>!testapi</code> — test KAGE X API\n"
         "<code>!ping</code> — latency\n"
-        "<code>!about</code> — info\n\n"
+        "<code>!about</code> — about KAGE X\n\n"
         f"⚡ Max <b>{MAX_NUM}</b> numbers per request."
     )
-    t = u.message or u.callback_query.message
     await t.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
 async def cmd_about(u: Update, _):
-    msg = (
-        "╔" + "═" * 34 + "╗\n"
-        f"║  ⚡ <b>{BOT_NAME}</b>  {BOT_VER}      ║\n"
-        "╚" + "═" * 34 + "╝\n\n"
-        "🔵 Primary: baron0.com/api/v2/check\n"
-        "🔄 Fallback: 5-method WA engine\n"
-        "🎯 Detects Personal / Regional / Admin bans\n"
-        "🌐 Global prefix: <code>!</code>"
-    )
     t = u.message or u.callback_query.message
+    await send_banner(t)
+    msg = (
+        "<blockquote>"
+        "👁  <b>K A G E  X  —  S H A D O W  E D I T I O N</b>  👁\n"
+        "<i>Version 8.0  ·  The darkest scanner alive.</i>\n\n"
+        "🌑 Every number holds a secret.\n"
+        "    We pull it straight from the shadow.\n\n"
+        "⚡ <b>Engine</b>      :  KAGE X Neural API\n"
+        "🛡 <b>Detection</b>  :  Personal · Regional · Admin\n"
+        "🌀 <b>Fallback</b>   :  5-Shadow Scan Engine\n"
+        "🔒 <b>Privacy</b>    :  Numbers always masked\n"
+        "🌐 <b>Prefix</b>     :  <code>!</code>\n\n"
+        "💀  <i>We see what others can't.</i>\n"
+        "    <i>The shadow never lies.</i>"
+        "</blockquote>"
+    )
     await t.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
 async def cmd_testapi(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     target = u.message or u.callback_query.message
-    wait   = await target.reply_text("🔍 Testing baron0 BanCheck API...",
+    await send_banner(target)
+    wait   = await target.reply_text("🔍 Testing KAGE X BanCheck API...",
                                      parse_mode=ParseMode.HTML)
     conn = aiohttp.TCPConnector(limit=5, ssl=False)
     async with aiohttp.ClientSession(connector=conn) as sess:
-        # Test with a well-known UK number
         result = await baron0_check(sess, "447386195088")
 
     if result is None:
         txt = (
-            "❌ <b>baron0 API: NO RESPONSE</b>\n\n"
+            "❌ <b>KAGE X API: NO RESPONSE</b>\n\n"
             "Possible causes:\n"
             "• API key expired or invalid\n"
-            "• baron0.com is down\n"
+            "• Engine is temporarily down\n"
             "• Network issue from Railway\n\n"
-            "Using fallback engine until resolved."
+            "Using shadow fallback engine until resolved."
         )
     elif result["status"] == "rate_limited":
-        txt = ("⏳ <b>baron0 API: RATE LIMITED</b>\n"
+        txt = ("⏳ <b>KAGE X API: RATE LIMITED</b>\n"
                "Wait 1 min and try again.")
     else:
         txt = (
-            f"✅ <b>baron0 API: CONNECTED & WORKING</b>\n\n"
-            f"Test number: <code>+447386195088</code>\n"
+            f"✅ <b>KAGE X API: CONNECTED &amp; WORKING</b>\n\n"
+            f"Test number: <code>+44738****088</code>\n"
             f"Result: <b>{result['status'].upper()}</b>\n"
-            f"API key is active 🔥"
+            f"💀 KAGE X is fully online 🔥"
         )
     await wait.edit_text(txt, parse_mode=ParseMode.HTML)
 
 
 async def cmd_ping(u: Update, _):
+    await send_banner(u.message)
     t0  = time.monotonic()
     msg = await u.message.reply_text("🏓 Pinging...")
     ms  = round((time.monotonic() - t0) * 1000)
@@ -634,6 +655,7 @@ async def cmd_check(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    await send_banner(u.message)
     wait = await u.message.reply_text(
         f"🌑 <b>Scanning</b> <code>{len(nums)}</code> number(s) through the shadow... ⚡",
         parse_mode=ParseMode.HTML,
