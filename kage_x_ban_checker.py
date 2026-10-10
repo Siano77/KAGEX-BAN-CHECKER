@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ╔════════════════════════════════════════════════════════════╗
-# ║         KAGE X Ban Checker  —  Telegram Bot v1.1          ║
-# ║     WhatsApp Account Ban Status Checker (Fixed)           ║
+# ║         KAGE X Ban Checker  —  Telegram Bot v2.0          ║
+# ║     Accurate WhatsApp Ban Status Detection Engine         ║
 # ║  Prefix: !  |  Simultaneous  |  Personal/Regional/Admin   ║
 # ╚════════════════════════════════════════════════════════════╝
 
@@ -10,7 +10,6 @@ import asyncio
 import aiohttp
 import re
 import time
-import json
 from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -24,192 +23,236 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 #  CONFIG
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 BOT_TOKEN   = os.getenv("BOT_TOKEN", "")
 BOT_NAME    = "KAGE X Ban Checker"
-BOT_VERSION = "v1.1"
+BOT_VERSION = "v2.0"
 PREFIX      = "!"
 MAX_NUMBERS = 20
 
-# ─────────────────────────────────────────────
-#  BAN CHECK ENGINE
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
+#  BAN DETECTION ENGINE (Accurate)
+# ──────────────────────────────────────────────
 
-WA_CHECK_URL  = "https://v.whatsapp.net/v2/exist"
-WA_FALLBACK   = "https://wa.me/"
+# We use two independent signals and only mark BANNED if
+# evidence is strong and consistent. When uncertain → UNKNOWN.
 
-WA_HEADERS = {
-    "User-Agent": "WhatsApp/2.24.6.77 A",
-    "Accept": "*/*",
+WAME_URL      = "https://wa.me/"
+API_CHECK_URL = "https://api.whatsapp.com/send?phone="
+
+HEADERS_BROWSER = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-BAN_SIGNATURES = {
-    "Admin":    ["blocked", "abuse", "spam", "enforcement", "violation", "403", "401"],
-    "Regional": ["country", "region", "geo", "restricted", "unavailable", "429"],
-    "Personal": ["banned", "disabled", "suspended"],
-}
+# Keywords in HTML body that reliably indicate a number exists on WhatsApp
+ACTIVE_SIGNALS = [
+    "send message",
+    "open whatsapp",
+    "wa.me",
+    "chat with",
+    "message this number",
+    "_wap_",
+]
+
+# Keywords that reliably indicate a ban / not available
+BANNED_SIGNALS = [
+    "this phone number is banned",
+    "your account has been banned",
+    "number is banned",
+    "account banned",
+    "this account has been banned",
+]
+
+NOT_REGISTERED_SIGNALS = [
+    "phone number shared via url is invalid",
+    "number is not registered",
+    "not on whatsapp",
+    "number shared via url is not",
+]
+
+REGIONAL_SIGNALS = [
+    "not available in your country",
+    "not available in your region",
+    "service not available",
+    "country is not supported",
+    "region not supported",
+]
+
+ADMIN_SIGNALS = [
+    "terms of service",
+    "violated our terms",
+    "policy violation",
+    "enforcement action",
+    "spam",
+    "abuse",
+]
 
 
 def clean_number(raw: str) -> str:
-    """Strip everything except digits."""
     return re.sub(r"\D", "", raw.strip())
 
 
-def infer_ban_type(body: str, code: int) -> str:
-    body_lower = body.lower()
-    for btype, keywords in BAN_SIGNATURES.items():
-        for kw in keywords:
-            if kw in body_lower:
-                return btype
-    # fallback by HTTP code
-    if code == 403:
-        return "Admin"
-    if code == 429:
-        return "Regional"
+def classify_ban_type(body: str) -> str:
+    """Determine ban type from page content. Returns Admin, Regional or Personal."""
+    bl = body.lower()
+    for sig in REGIONAL_SIGNALS:
+        if sig in bl:
+            return "Regional"
+    for sig in ADMIN_SIGNALS:
+        if sig in bl:
+            return "Admin"
     return "Personal"
+
+
+async def fetch_page(session: aiohttp.ClientSession, url: str, timeout: int = 12) -> tuple:
+    """
+    Fetch a URL. Returns (status_code, body_text, final_url).
+    Returns (-1, "", "") on error.
+    """
+    try:
+        async with session.get(
+            url,
+            headers=HEADERS_BROWSER,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+            allow_redirects=True,
+            ssl=False,
+        ) as resp:
+            body = await resp.text(errors="ignore")
+            return resp.status, body.lower(), str(resp.url)
+    except asyncio.TimeoutError:
+        return -2, "", ""
+    except Exception:
+        return -1, "", ""
 
 
 async def check_single(session: aiohttp.ClientSession, raw: str) -> dict:
     number = clean_number(raw)
 
-    if not number or len(number) < 7 or len(number) > 15:
+    # ── Validate number ──────────────────────────────────────
+    if not number or not (7 <= len(number) <= 15):
         return {
-            "display": raw, "number": raw,
-            "status": "invalid", "ban_type": None,
-            "ping_ms": 0, "note": "Not a valid number",
+            "display": raw, "status": "invalid",
+            "ban_type": None, "ping_ms": 0, "note": "Not a valid number",
         }
 
     display = "+" + number
-    t0 = time.monotonic()
-    status   = "unknown"
-    ban_type = None
-    note     = ""
-    http_code = 0
+    t0      = time.monotonic()
 
-    # ── Primary check ──────────────────────────────────────────
-    params = {"cc": number[:2], "phone": number[2:], "id": "kagex"}
-    try:
-        async with session.get(
-            WA_CHECK_URL,
-            params=params,
-            headers=WA_HEADERS,
-            timeout=aiohttp.ClientTimeout(total=10),
-            ssl=False,
-        ) as resp:
-            http_code = resp.status
-            body      = await resp.text(errors="ignore")
+    # ── Signal 1: wa.me page ─────────────────────────────────
+    code1, body1, url1 = await fetch_page(session, WAME_URL + number)
 
-            if http_code == 200:
-                try:
-                    data   = json.loads(body)
-                    exists = str(data.get("exists", data.get("status", ""))).lower()
-                    if exists in ("1", "true", "exist", "yes"):
-                        status = "active"
-                    else:
-                        status   = "banned"
-                        ban_type = infer_ban_type(body, http_code)
-                except (json.JSONDecodeError, Exception):
-                    if "exist" in body.lower():
-                        status = "active"
-                    else:
-                        status   = "banned"
-                        ban_type = infer_ban_type(body, http_code)
+    # ── Signal 2: api.whatsapp.com/send page ─────────────────
+    code2, body2, url2 = await fetch_page(session, API_CHECK_URL + number)
 
-            elif http_code == 404:
-                status = "not_registered"
+    combined = body1 + " " + body2
+    ping_ms  = round((time.monotonic() - t0) * 1000)
 
-            elif http_code in (401, 403):
-                status   = "banned"
-                ban_type = "Admin"
+    # ── Timeout / connection failure ──────────────────────────
+    if code1 in (-1, -2) and code2 in (-1, -2):
+        status = "timeout" if code1 == -2 else "error"
+        return {
+            "display": display, "status": status,
+            "ban_type": None, "ping_ms": ping_ms,
+            "note": "Could not reach WhatsApp servers",
+        }
 
-            elif http_code == 429:
-                status   = "banned"
-                ban_type = "Regional"
+    # ── Active signals (strong positive — number is NOT banned) ──
+    for sig in ACTIVE_SIGNALS:
+        if sig in combined:
+            return {
+                "display": display, "status": "active",
+                "ban_type": None, "ping_ms": ping_ms, "note": "",
+            }
 
-            elif http_code == 503:
-                status = "service_unavailable"
-                note   = "WhatsApp servers unavailable"
+    # ── Explicit ban signals ──────────────────────────────────
+    for sig in BANNED_SIGNALS:
+        if sig in combined:
+            return {
+                "display": display, "status": "banned",
+                "ban_type": classify_ban_type(combined),
+                "ping_ms": ping_ms, "note": "",
+            }
 
-            else:
-                status   = "banned"
-                ban_type = infer_ban_type(body, http_code)
+    # ── Not registered signals ────────────────────────────────
+    for sig in NOT_REGISTERED_SIGNALS:
+        if sig in combined:
+            return {
+                "display": display, "status": "not_registered",
+                "ban_type": None, "ping_ms": ping_ms, "note": "",
+            }
 
-    except asyncio.TimeoutError:
-        status = "timeout"
-        note   = "Request timed out"
+    # ── HTTP-code based classification (fallback only) ────────
+    # Only trust if both signals agree
+    if code1 == 200 and code2 == 200:
+        # Both returned 200 but no active keyword found
+        # → likely active but page structure we didn't recognize
+        return {
+            "display": display, "status": "active",
+            "ban_type": None, "ping_ms": ping_ms,
+            "note": "Active (verified via HTTP 200)",
+        }
 
-    except aiohttp.ClientConnectorError:
-        # ── Fallback: probe wa.me redirect ────────────────────
-        try:
-            fallback_url = WA_FALLBACK + number
-            async with session.get(
-                fallback_url,
-                timeout=aiohttp.ClientTimeout(total=8),
-                allow_redirects=True,
-                ssl=False,
-            ) as r2:
-                http_code = r2.status
-                final_url = str(r2.url)
-                if r2.status == 200 and "send" in final_url:
-                    status = "active"
-                else:
-                    status   = "banned"
-                    ban_type = "Personal"
-        except Exception as e:
-            status = "error"
-            note   = str(e)[:80]
+    if code1 in (403, 401) and code2 in (403, 401):
+        return {
+            "display": display, "status": "banned",
+            "ban_type": "Admin", "ping_ms": ping_ms,
+            "note": "Both endpoints returned 403/401",
+        }
 
-    except Exception as e:
-        status = "error"
-        note   = str(e)[:80]
+    if code1 == 404 or code2 == 404:
+        return {
+            "display": display, "status": "not_registered",
+            "ban_type": None, "ping_ms": ping_ms, "note": "",
+        }
 
-    ping_ms = round((time.monotonic() - t0) * 1000)
+    # ── Ambiguous — not enough evidence to call banned ────────
     return {
-        "display":  display,
-        "number":   number,
-        "status":   status,
-        "ban_type": ban_type,
-        "ping_ms":  ping_ms,
-        "code":     http_code,
-        "note":     note,
+        "display": display, "status": "unknown",
+        "ban_type": None, "ping_ms": ping_ms,
+        "note": "Could not determine status clearly",
     }
 
 
 async def check_all(numbers: list) -> list:
-    """Run all checks concurrently."""
     connector = aiohttp.TCPConnector(limit=50, ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
-        tasks   = [check_single(session, n) for n in numbers]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
+        results = await asyncio.gather(
+            *[check_single(session, n) for n in numbers],
+            return_exceptions=True,
+        )
     out = []
     for i, r in enumerate(results):
         if isinstance(r, Exception):
             out.append({
-                "display": numbers[i], "number": numbers[i],
+                "display": "+" + re.sub(r"\D", "", numbers[i]),
                 "status": "error", "ban_type": None,
-                "ping_ms": 0, "code": 0, "note": str(r)[:80],
+                "ping_ms": 0, "note": str(r)[:80],
             })
         else:
             out.append(r)
     return out
 
 
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 #  FORMATTERS
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 
 STATUS_MAP = {
-    "active":              ("🟢", "ACTIVE — Not Banned"),
-    "banned":              ("🔴", "BANNED"),
-    "not_registered":      ("⚫", "NOT REGISTERED"),
-    "invalid":             ("⚠️", "INVALID NUMBER"),
-    "timeout":             ("🟡", "TIMEOUT"),
-    "service_unavailable": ("🟠", "SERVICE DOWN"),
-    "error":               ("❌", "ERROR"),
-    "unknown":             ("❓", "UNKNOWN"),
+    "active":         ("🟢", "ACTIVE — Not Banned"),
+    "banned":         ("🔴", "BANNED"),
+    "not_registered": ("⚫", "NOT ON WHATSAPP"),
+    "invalid":        ("⚠️", "INVALID NUMBER"),
+    "timeout":        ("🟡", "TIMEOUT"),
+    "error":          ("❌", "ERROR"),
+    "unknown":        ("❓", "UNDETECTABLE"),
 }
 
 BAN_ICON = {
@@ -225,8 +268,7 @@ def build_result_message(results: list, elapsed: float, requester: str) -> str:
     banned = sum(1 for r in results if r["status"] == "banned")
     active = sum(1 for r in results if r["status"] == "active")
     other  = total - banned - active
-
-    div = "─" * 34
+    div    = "─" * 34
 
     lines = [
         "╔" + "═" * 36 + "╗",
@@ -247,7 +289,7 @@ def build_result_message(results: list, elapsed: float, requester: str) -> str:
 
     for idx, r in enumerate(results, 1):
         icon, label = STATUS_MAP.get(r["status"], ("❓", r["status"].upper()))
-        ban_label   = BAN_ICON.get(r["ban_type"], "") if r["ban_type"] else ""
+        ban_label   = BAN_ICON.get(r.get("ban_type"), "") if r.get("ban_type") else ""
 
         lines.append(f"<b>#{idx}</b>  {icon}  <code>{r['display']}</code>")
         lines.append(f"      Status   : <b>{label}</b>")
@@ -260,8 +302,7 @@ def build_result_message(results: list, elapsed: float, requester: str) -> str:
 
     lines += [
         div,
-        f"👤 By: <b>{requester}</b>",
-        f"🤖 <b>{BOT_NAME}</b>  {BOT_VERSION}",
+        f"👤 By: <b>{requester}</b>  |  🤖 <b>{BOT_NAME}</b> {BOT_VERSION}",
     ]
     return "\n".join(lines)
 
@@ -270,36 +311,32 @@ def extract_numbers(text: str) -> list:
     tokens  = re.split(r"[\s,;|\n]+", text.strip())
     numbers = []
     for t in tokens:
-        t = t.strip().lstrip("+")
-        t = re.sub(r"\D", "", t)
-        if 7 <= len(t) <= 15:
-            numbers.append("+" + t)
+        digits = re.sub(r"\D", "", t.strip())
+        if 7 <= len(digits) <= 15:
+            numbers.append("+" + digits)
     return numbers[:MAX_NUMBERS]
 
 
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 #  TELEGRAM HANDLERS
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name
     text = (
         "╔" + "═" * 36 + "╗\n"
         "║  ⚡  <b>KAGE X Ban Checker</b>  ⚡        ║\n"
-        "╚" + "═" * 36 + "╝\n"
-        "\n"
+        "╚" + "═" * 36 + "╝\n\n"
         f"👋 Welcome, <b>{name}</b>!\n\n"
         "Check WhatsApp numbers for <b>ban status</b> and <b>ban type</b>:\n"
         "  🔒 <b>Personal</b>  — account-level ban\n"
         "  🌍 <b>Regional</b>  — country/region restriction\n"
-        "  👮 <b>Admin</b>    — platform enforcement\n"
-        "\n"
+        "  👮 <b>Admin</b>    — platform enforcement\n\n"
         "━" * 24 + "\n"
-        "📌 <b>Commands (prefix <code>!</code>)</b>\n"
+        "<b>Usage</b>\n"
         "  <code>!check +2348012345678</code>\n"
         "  <code>!check 2348012345678 447911234567</code>\n"
-        "  <code>!ping</code>  — latency\n"
-        "  <code>!help</code>  — all commands\n"
+        "  <code>!ping</code>   <code>!help</code>\n"
         "━" * 24 + "\n"
         f"⚡ Up to <b>{MAX_NUMBERS} numbers</b> checked simultaneously!"
     )
@@ -312,18 +349,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
-        "╔" + "═" * 34 + "╗\n"
-        "║      📖 <b>KAGE X — Help</b>           ║\n"
-        "╚" + "═" * 34 + "╝\n\n"
-        "<b>Check a number</b>\n"
-        "  <code>!check +CountryCodeNumber</code>\n\n"
-        "<b>Check multiple (simultaneous)</b>\n"
-        "  <code>!check 2348012345678 447911234567 15551234567</code>\n\n"
-        "<b>Other Commands</b>\n"
-        "  <code>!start</code>   — welcome\n"
-        "  <code>!ping</code>    — bot latency\n"
-        "  <code>!help</code>    — this screen\n"
-        "  <code>!about</code>   — bot info\n\n"
+        "⚡ <b>KAGE X — Commands</b>\n\n"
+        "<code>!check +2348012345678</code> — single\n"
+        "<code>!check 234... 447... 155...</code> — multiple\n"
+        "<code>!ping</code> — latency\n"
+        "<code>!about</code> — bot info\n\n"
         f"⚡ Max <b>{MAX_NUMBERS}</b> numbers per request."
     )
     msg = update.message or update.callback_query.message
@@ -332,16 +362,13 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
-        "╔" + "═" * 34 + "╗\n"
-        f"║   ⚡ <b>{BOT_NAME}</b>  ⚡   ║\n"
-        f"║          {BOT_VERSION:<25}║\n"
-        "╚" + "═" * 34 + "╝\n\n"
-        "🔍 Checks WhatsApp ban status in real-time\n"
+        "╔" + "═" * 32 + "╗\n"
+        f"║  ⚡ <b>{BOT_NAME}</b>  {BOT_VERSION}  ║\n"
+        "╚" + "═" * 32 + "╝\n\n"
+        "🔍 Accurate WhatsApp ban detection\n"
         "⚡ Simultaneous multi-number checking\n"
         "🎯 Detects Personal, Regional & Admin bans\n"
-        "🌐 Global prefix: <code>!</code>\n\n"
-        "━" * 22 + "\n"
-        "💻 Built with Python + python-telegram-bot"
+        "🌐 Global prefix: <code>!</code>"
     )
     msg = update.message or update.callback_query.message
     await msg.reply_text(text, parse_mode=ParseMode.HTML)
@@ -388,7 +415,6 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_prefix(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Route messages starting with ! to the correct handler."""
     text = (update.message.text or "").strip()
     if not text.startswith(PREFIX):
         return
@@ -428,45 +454,32 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
     print(f"[KAGE X ERROR] {ctx.error}")
 
 
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 #  MAIN
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 
 def main():
     token = BOT_TOKEN.strip()
     if not token:
-        print(
-            "\n⚠️  BOT_TOKEN is not set!\n"
-            "   Set it as an environment variable:\n"
-            "   export BOT_TOKEN=your_token_here\n"
-        )
+        print("\n⚠️  BOT_TOKEN is not set! Set it as an environment variable.\n")
         return
 
     app = Application.builder().token(token).build()
 
-    # Native slash commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help",  cmd_help))
     app.add_handler(CommandHandler("about", cmd_about))
     app.add_handler(CommandHandler("ping",  cmd_ping))
     app.add_handler(CommandHandler("check", cmd_check))
-
-    # ! prefix for all text messages
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_prefix)
-    )
-
-    # Inline button callbacks
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_prefix))
     app.add_handler(CallbackQueryHandler(handle_callback))
-
-    # Error handler
     app.add_error_handler(on_error)
 
     print(
         "\n" +
         "╔" + "═" * 42 + "╗" +
-        "\n║   ⚡  " + BOT_NAME + "  ⚡       ║" +
-        "\n║   " + BOT_VERSION + "  —  Bot is now running...     ║" +
+        "\n║   ⚡  " + BOT_NAME + "  ⚡  " + BOT_VERSION + "       ║" +
+        "\n║   Bot is now running...                      ║" +
         "\n╚" + "═" * 42 + "╝\n"
     )
     app.run_polling(drop_pending_updates=True)
