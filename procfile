@@ -1,0 +1,1 @@
+worker: python kage_x_ban_checker.py
