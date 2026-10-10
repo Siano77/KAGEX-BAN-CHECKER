@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ╔══════════════════════════════════════════════════════════╗
-# ║        KAGE X Ban Checker  —  Telegram Bot v3.0         ║
-# ║   Real WhatsApp API Detection  |  Accurate Per-Number    ║
+# ║        KAGE X Ban Checker  —  Telegram Bot v4.0         ║
+# ║   Accurate  |  Real WA API  |  No False Invalids        ║
 # ║   Prefix: !  |  Simultaneous  |  Admin/Regional/Personal ║
 # ╚══════════════════════════════════════════════════════════╝
 
@@ -15,9 +15,6 @@ import string
 import json
 from datetime import datetime
 
-import phonenumbers
-from phonenumbers import NumberParseException
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -29,29 +26,107 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-# ═══════════════════════════════════════════════════════
+# ----------------------------------------------------------------
 #  CONFIG
-# ═══════════════════════════════════════════════════════
+# ----------------------------------------------------------------
 BOT_TOKEN   = os.getenv("BOT_TOKEN", "")
 BOT_NAME    = "KAGE X Ban Checker"
-BOT_VERSION = "v3.0"
+BOT_VERSION = "v4.0"
 PREFIX      = "!"
 MAX_NUMBERS = 20
 
-# ═══════════════════════════════════════════════════════
+# ----------------------------------------------------------------
+#  NUMBER PARSING  (lenient — never falsely rejects real numbers)
+# ----------------------------------------------------------------
+
+# Known country codes ordered longest-first so we match greedily
+# (e.g. 234 before 23 before 2)
+KNOWN_CC = [
+    "1","7","20","27","30","31","32","33","34","36","39","40","41",
+    "43","44","45","46","47","48","49","51","52","53","54","55","56",
+    "57","58","60","61","62","63","64","65","66","81","82","84","86",
+    "90","91","92","93","94","95","98",
+    "212","213","216","218","220","221","222","223","224","225","226",
+    "227","228","229","230","231","232","233","234","235","236","237",
+    "238","239","240","241","242","243","244","245","246","247","248",
+    "249","250","251","252","253","254","255","256","257","258","260",
+    "261","262","263","264","265","266","267","268","269",
+    "290","291","297","298","299",
+    "350","351","352","353","354","355","356","357","358","359",
+    "370","371","372","373","374","375","376","377","378","380",
+    "381","382","385","386","387","389",
+    "420","421","423",
+    "500","501","502","503","504","505","506","507","508","509",
+    "590","591","592","593","594","595","596","597","598","599",
+    "670","672","673","674","675","676","677","678","679","680",
+    "681","682","683","685","686","687","688","689","690","691",
+    "692",
+    "800","808","850","852","853","855","856",
+    "880","886",
+    "960","961","962","963","964","965","966","967","968","970",
+    "971","972","973","974","975","976","977",
+    "992","993","994","995","996","998",
+]
+# Sort longest first
+KNOWN_CC_SORTED = sorted(set(KNOWN_CC), key=len, reverse=True)
+
+
+def parse_number(raw: str):
+    """
+    Parse a phone number into (country_code, national_number, display).
+    Uses a large country-code table and never rejects real numbers.
+    Returns None only if the digits are too short or too long to be valid.
+    """
+    digits = re.sub(r"\D", "", raw.strip())
+    if not digits:
+        return None
+    if len(digits) < 7 or len(digits) > 15:
+        return None
+
+    display = "+" + digits
+
+    # Step 1: try to match a known country code prefix
+    for cc in KNOWN_CC_SORTED:
+        if digits.startswith(cc):
+            nn = digits[len(cc):]
+            if len(nn) >= 4:          # national part must be at least 4 digits
+                return cc, nn, display
+
+    # Step 2: fallback — try splitting at 1, 2, 3 digits for cc
+    for cc_len in (1, 2, 3):
+        if len(digits) > cc_len + 4:
+            cc = digits[:cc_len]
+            nn = digits[cc_len:]
+            return cc, nn, display
+
+    # Step 3: absolute last resort — send the whole number as national part
+    return "1", digits, display
+
+
+def extract_numbers(text: str) -> list:
+    tokens  = re.split(r"[\s,;|\n]+", text.strip())
+    numbers = []
+    seen    = set()
+    for t in tokens:
+        digits = re.sub(r"\D", "", t.strip())
+        if 7 <= len(digits) <= 15 and digits not in seen:
+            seen.add(digits)
+            numbers.append(digits)   # store raw digits, display added later
+    return numbers[:MAX_NUMBERS]
+
+
+# ----------------------------------------------------------------
 #  WHATSAPP REAL API ENGINE
-# ═══════════════════════════════════════════════════════
+# ----------------------------------------------------------------
 
-# WhatsApp's internal existence-check endpoint (same one the app uses)
-WA_EXIST_URL  = "https://v.whatsapp.net/v2/exist"
-WA_REG_URL    = "https://v.whatsapp.net/v2/register"
+WA_EXIST_URL = "https://v.whatsapp.net/v2/exist"
 
-# Rotate user agents to reduce rate-limit risk
 WA_USER_AGENTS = [
     "WhatsApp/2.24.8.78 A",
     "WhatsApp/2.24.6.77 A",
     "WhatsApp/2.23.25.84 A",
     "WhatsApp/2.24.10.84 A",
+    "WhatsApp/2.24.12.80 A",
 ]
 
 
@@ -65,75 +140,48 @@ def _wa_headers() -> dict:
     }
 
 
-def _rand_id(length: int = 16) -> str:
-    """Random alphanumeric device ID."""
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
+def _rand_id(n: int = 16) -> str:
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
 
-def parse_number(raw: str):
-    """
-    Parse and validate a phone number.
-    Returns (country_code_str, national_number_str, display_str) or None.
-    """
-    digits = re.sub(r"\D", "", raw.strip())
-    if not digits:
-        return None
-    try:
-        parsed = phonenumbers.parse("+" + digits, None)
-        if not phonenumbers.is_valid_number(parsed):
-            # Try assuming it needs a leading digit
-            return None
-        cc = str(parsed.country_code)
-        nn = str(parsed.national_number)
-        display = "+" + digits
-        return cc, nn, display
-    except NumberParseException:
-        return None
-
-
-# ─── Ban-type classification from WhatsApp API reason codes ───
-
-REASON_TO_STATUS = {
-    # Active / registered
-    "exist":           ("active",   None),
-    "ok":              ("active",   None),
-
-    # Banned reasons  ─ personal account violation
-    "blocked":         ("banned",   "Personal"),
-    "gone":            ("banned",   "Personal"),
-    "banned":          ("banned",   "Personal"),
-    "suspended":       ("banned",   "Personal"),
-    "disabled":        ("banned",   "Personal"),
-
-    # Not registered / never had WA
-    "unregistered":    ("not_registered", None),
-    "not_exist":       ("not_registered", None),
-    "nonexistent":     ("not_registered", None),
-
-    # Parameter / format issues
-    "bad_param":       ("invalid",  None),
-    "country-code-invalid": ("invalid", None),
-    "enum_mismatch":   ("invalid",  None),
+# WhatsApp API reason → (status, default_ban_type)
+REASON_MAP = {
+    # active
+    "exist":               ("active",         None),
+    "ok":                  ("active",         None),
+    # personal bans
+    "blocked":             ("banned",         "Personal"),
+    "gone":                ("banned",         "Personal"),
+    "banned":              ("banned",         "Personal"),
+    "suspended":           ("banned",         "Personal"),
+    "disabled":            ("banned",         "Personal"),
+    "unauthorized":        ("banned",         "Personal"),
+    # not registered
+    "unregistered":        ("not_registered", None),
+    "not_exist":           ("not_registered", None),
+    "nonexistent":         ("not_registered", None),
+    "missing":             ("not_registered", None),
+    # bad input
+    "bad_param":           ("invalid_input",  None),
+    "country-code-invalid":("invalid_input",  None),
+    "enum_mismatch":       ("invalid_input",  None),
+    # rate limit
+    "too_recent":          ("rate_limited",   None),
+    "try_later":           ("rate_limited",   None),
 }
 
 
-async def _call_exist_api(
-    session: aiohttp.ClientSession,
-    cc: str,
-    nn: str,
+async def _wa_exist_api(
+    session: aiohttp.ClientSession, cc: str, nn: str
 ) -> dict:
-    """
-    Call WhatsApp's v2/exist endpoint.
-    Returns parsed JSON dict or {} on failure.
-    """
+    """Call WhatsApp's v2/exist endpoint and return parsed JSON + meta."""
     params = {
-        "cc":    cc,
-        "phone": nn,
-        "id":    _rand_id(),
-        "lg":    "en",
-        "lc":    "US",
+        "cc":      cc,
+        "phone":   nn,
+        "id":      _rand_id(),
+        "lg":      "en",
+        "lc":      "US",
         "authkey": _rand_id(24),
-        "_": str(int(time.time() * 1000)),
     }
     try:
         async with session.get(
@@ -144,35 +192,30 @@ async def _call_exist_api(
             ssl=False,
             allow_redirects=True,
         ) as resp:
-            http_code = resp.status
-            text = await resp.text(errors="ignore")
-
+            http   = resp.status
+            body   = await resp.text(errors="ignore")
             try:
-                data = json.loads(text)
+                data = json.loads(body)
             except Exception:
                 data = {}
-
-            data["_http"] = http_code
-            data["_raw"]  = text[:300]
+            data["_http"] = http
+            data["_body"] = body[:400].lower()
             return data
-
     except asyncio.TimeoutError:
-        return {"_error": "timeout"}
+        return {"_err": "timeout"}
     except Exception as e:
-        return {"_error": str(e)[:80]}
+        return {"_err": str(e)[:100]}
 
 
 async def _classify_ban_type(
-    session: aiohttp.ClientSession,
-    full_number: str,
+    session: aiohttp.ClientSession, full_digits: str
 ) -> str:
     """
-    Secondary check for banned numbers to determine ban category.
-    Uses WhatsApp's web send page HTML for additional signals.
-    Defaults to Personal if inconclusive.
+    Secondary page check to classify ban as Admin, Regional, or Personal.
+    Called only after we confirmed the number IS banned.
     """
-    url = "https://api.whatsapp.com/send?phone=" + full_number
-    headers = {
+    url = "https://api.whatsapp.com/send?phone=" + full_digits
+    hdrs = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -182,149 +225,129 @@ async def _classify_ban_type(
     }
     try:
         async with session.get(
-            url, headers=headers,
+            url, headers=hdrs,
             timeout=aiohttp.ClientTimeout(total=8),
             ssl=False, allow_redirects=True,
         ) as resp:
             body = (await resp.text(errors="ignore")).lower()
-
-            # Regional signals
-            regional_kw = [
-                "not available in your country",
-                "not available in your region",
-                "country is not supported",
-                "region not supported",
-                "service is not available",
-            ]
-            for kw in regional_kw:
-                if kw in body:
-                    return "Regional"
-
-            # Admin/policy signals
-            admin_kw = [
-                "terms of service",
-                "policy violation",
-                "enforcement",
-                "violated our",
-                "spam",
-                "abuse report",
-            ]
-            for kw in admin_kw:
-                if kw in body:
-                    return "Admin"
-
-            # HTTP 403 = admin enforcement
             if resp.status == 403:
                 return "Admin"
-
+            for kw in ("not available in your country", "not available in your region",
+                       "service not available", "country is not supported"):
+                if kw in body:
+                    return "Regional"
+            for kw in ("terms of service", "policy violation", "enforcement",
+                       "violated our", "spam", "abuse report"):
+                if kw in body:
+                    return "Admin"
     except Exception:
         pass
-
     return "Personal"
 
 
 async def check_single(
-    session: aiohttp.ClientSession,
-    raw: str,
+    session: aiohttp.ClientSession, raw_digits: str
 ) -> dict:
-    """Full check pipeline for one number. Returns result dict."""
+    """Full check for one number. Returns structured result dict."""
 
-    # ── 1. Parse & validate ───────────────────────────────
-    parsed = parse_number(raw)
+    parsed = parse_number(raw_digits)
     if not parsed:
         return {
-            "display":  "+" + re.sub(r"\D", "", raw) or raw,
+            "display":  "+" + raw_digits,
             "status":   "invalid",
             "ban_type": None,
             "ping_ms":  0,
-            "note":     "Invalid / unrecognized number",
+            "note":     "Number too short or too long",
         }
 
     cc, nn, display = parsed
-    full_number = cc + nn
     t0 = time.monotonic()
 
-    # ── 2. WhatsApp real API call ───────────────────────────
-    data = await _call_exist_api(session, cc, nn)
+    data    = await _wa_exist_api(session, cc, nn)
     ping_ms = round((time.monotonic() - t0) * 1000)
 
-    # ── 3. Handle connection errors ─────────────────────────
-    if "_error" in data:
-        err = data["_error"]
+    # ─ Connection/timeout errors
+    if "_err" in data:
+        err = data["_err"]
         return {
             "display":  display,
             "status":   "timeout" if err == "timeout" else "error",
             "ban_type": None,
             "ping_ms":  ping_ms,
-            "note":     err if err != "timeout" else "Request timed out",
+            "note":     "Request timed out" if err == "timeout" else err,
         }
 
-    http  = data.get("_http", 200)
+    http         = data.get("_http", 200)
+    body_lower   = data.get("_body", "")
     status_field = str(data.get("status", "")).lower()
     result_field = str(data.get("result", "")).lower()
     reason_field = str(data.get("reason", "")).lower()
+    login_field  = str(data.get("login",  "")).lower()
 
-    # ── 4. Classify from API response ──────────────────────
+    final_status = None
+    ban_type     = None
+    note         = ""
 
-    # 4a. Explicit "ok" status with result
+    # ─ Case 1: API returned explicit "ok"
     if status_field == "ok":
-        mapped = REASON_TO_STATUS.get(result_field)
+        mapped = REASON_MAP.get(result_field)
         if mapped:
             final_status, ban_type = mapped
         else:
-            # "ok" with no result → active
-            final_status, ban_type = "active", None
+            # "ok" with unknown result or login present ⇒ active
+            final_status = "active"
 
-    # 4b. Explicit "fail" status with reason
+    # ─ Case 2: API returned explicit "fail"
     elif status_field == "fail":
-        mapped = REASON_TO_STATUS.get(reason_field)
+        mapped = REASON_MAP.get(reason_field)
         if mapped:
             final_status, ban_type = mapped
+            if reason_field and final_status == "banned":
+                note = f"Reason: {reason_field}"
         else:
-            # Unknown fail reason → treat conservatively
-            final_status, ban_type = "unknown", None
+            final_status = "unknown"
+            note = f"API reason: {reason_field}" if reason_field else ""
 
-    # 4c. HTTP-code based fallback
-    elif http == 200:
-        # Check raw text
-        raw_lower = data.get("_raw", "").lower()
-        if "exist" in raw_lower or "login" in raw_lower:
-            final_status, ban_type = "active", None
-        elif any(w in raw_lower for w in ("blocked", "banned", "gone", "suspended")):
-            final_status, ban_type = "banned", None
-        else:
-            final_status, ban_type = "unknown", None
-
-    elif http in (401, 403):
-        final_status, ban_type = "banned", "Admin"
-
-    elif http == 404:
-        final_status, ban_type = "not_registered", None
-
-    elif http == 429:
-        final_status, ban_type = "rate_limited", None
-
-    elif http == 503:
-        final_status, ban_type = "service_down", None
-
+    # ─ Case 3: No JSON status — fall back to HTTP code + body scan
     else:
-        final_status, ban_type = "unknown", None
+        # Body keyword scan
+        if any(w in body_lower for w in ("\"exist\"", "login", "result\":\"ok")):
+            final_status = "active"
+        elif any(w in body_lower for w in ("blocked", "banned", "gone", "suspended")):
+            final_status = "banned"
+        elif any(w in body_lower for w in ("unregistered", "not_exist", "nonexistent")):
+            final_status = "not_registered"
+        elif http == 200:
+            # 200 with no clear signal: treat as active (conservative)
+            final_status = "active"
+            note = "Active (HTTP 200)"
+        elif http in (401, 403):
+            final_status = "banned"
+            ban_type     = "Admin"
+        elif http == 404:
+            final_status = "not_registered"
+        elif http == 429:
+            final_status = "rate_limited"
+        elif http >= 500:
+            final_status = "service_down"
+        else:
+            final_status = "unknown"
 
-    # ── 5. For banned numbers: run secondary ban-type classification ──
-    if final_status == "banned" and ban_type in (None, "Personal"):
-        ban_type = await _classify_ban_type(session, full_number)
+    # ─ Classify ban type for confirmed bans
+    if final_status == "banned" and ban_type is None:
+        ban_type = await _classify_ban_type(session, cc + nn)
 
     return {
         "display":  display,
         "status":   final_status,
         "ban_type": ban_type,
         "ping_ms":  ping_ms,
-        "note":     f"API reason: {reason_field}" if reason_field and final_status not in ("active",) else "",
+        "note":     note,
     }
 
 
 async def check_all(numbers: list) -> list:
-    """Check all numbers simultaneously."""
+    """Run all checks simultaneously."""
     connector = aiohttp.TCPConnector(limit=50, ssl=False, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=connector) as session:
         results = await asyncio.gather(
@@ -335,7 +358,7 @@ async def check_all(numbers: list) -> list:
     for i, r in enumerate(results):
         if isinstance(r, Exception):
             out.append({
-                "display":  numbers[i],
+                "display":  "+" + numbers[i],
                 "status":   "error",
                 "ban_type": None,
                 "ping_ms":  0,
@@ -346,26 +369,27 @@ async def check_all(numbers: list) -> list:
     return out
 
 
-# ═══════════════════════════════════════════════════════
+# ----------------------------------------------------------------
 #  FORMATTERS
-# ═══════════════════════════════════════════════════════
+# ----------------------------------------------------------------
 
 STATUS_MAP = {
     "active":         ("🟢", "ACTIVE — Not Banned"),
     "banned":         ("🔴", "BANNED"),
     "not_registered": ("⚫", "NOT ON WHATSAPP"),
     "invalid":        ("⚠️", "INVALID NUMBER"),
+    "invalid_input":  ("⚠️", "INVALID FORMAT"),
     "timeout":        ("🟡", "TIMEOUT"),
-    "rate_limited":   ("⏳", "RATE LIMITED — Retry later"),
+    "rate_limited":   ("⏳", "RATE LIMITED"),
     "service_down":   ("🟠", "WA SERVICE DOWN"),
     "error":          ("❌", "ERROR"),
     "unknown":        ("❓", "UNDETECTABLE"),
 }
 
 BAN_ICON = {
-    "Admin":    "👮 Admin Ban     — Platform enforcement",
-    "Regional": "🌍 Regional Ban  — Country/region blocked",
-    "Personal": "🔒 Personal Ban  — Account violation",
+    "Admin":    "👮 Admin Ban",
+    "Regional": "🌍 Regional Ban",
+    "Personal": "🔒 Personal Ban",
 }
 
 
@@ -379,16 +403,16 @@ def build_result_message(results: list, elapsed: float, requester: str) -> str:
 
     lines = [
         "╔" + "═" * 38 + "╗",
-        "║   ⚡  <b>KAGE X Ban Checker</b>  ⚡ v3.0   ║",
+        "║   ⚡  <b>KAGE X Ban Checker</b>  ⚡  v4.0  ║",
         f"║   🗓 {now:<31}║",
         "╚" + "═" * 38 + "╝",
         "",
         "📊 <b>Summary</b>",
-        f"   • Total     : <code>{total}</code>",
-        f"   • 🔴 Banned   : <code>{banned}</code>",
-        f"   • 🟢 Active   : <code>{active}</code>",
-        f"   • ❓ Other    : <code>{other}</code>",
-        f"   • ⏱ Speed    : <code>{elapsed:.2f}s</code>",
+        f"   • Total    : <code>{total}</code>",
+        f"   • 🔴 Banned  : <code>{banned}</code>",
+        f"   • 🟢 Active  : <code>{active}</code>",
+        f"   • ❓ Other   : <code>{other}</code>",
+        f"   • ⏱ Speed   : <code>{elapsed:.2f}s</code>",
         "",
         div, "",
     ]
@@ -400,7 +424,7 @@ def build_result_message(results: list, elapsed: float, requester: str) -> str:
         lines.append(f"<b>#{idx}</b>  {icon}  <code>{r['display']}</code>")
         lines.append(f"       Status   : <b>{label}</b>")
         if ban_label:
-            lines.append(f"       Ban Type : {ban_label}")
+            lines.append(f"       Ban Type : <b>{ban_label}</b>")
         lines.append(f"       Ping     : <code>{r['ping_ms']} ms</code>")
         if r.get("note"):
             lines.append(f"       Note     : <i>{r['note']}</i>")
@@ -411,42 +435,28 @@ def build_result_message(results: list, elapsed: float, requester: str) -> str:
     return "\n".join(lines)
 
 
-def extract_numbers(text: str) -> list:
-    tokens  = re.split(r"[\s,;|\n]+", text.strip())
-    numbers = []
-    seen    = set()
-    for t in tokens:
-        digits = re.sub(r"\D", "", t.strip())
-        if 7 <= len(digits) <= 15 and digits not in seen:
-            seen.add(digits)
-            numbers.append("+" + digits)
-    return numbers[:MAX_NUMBERS]
-
-
-# ═══════════════════════════════════════════════════════
+# ----------------------------------------------------------------
 #  TELEGRAM HANDLERS
-# ═══════════════════════════════════════════════════════
+# ----------------------------------------------------------------
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name
     text = (
         "╔" + "═" * 38 + "╗\n"
-        "║   ⚡  <b>KAGE X Ban Checker</b>  ⚡ v3.0   ║\n"
+        "║   ⚡  <b>KAGE X Ban Checker</b>  ⚡  v4.0  ║\n"
         "╚" + "═" * 38 + "╝\n\n"
         f"👋 Welcome, <b>{name}</b>!\n\n"
-        "Accurately checks each WhatsApp number via\n"
-        "<b>WhatsApp’s real internal API</b> — per number, simultaneously.\n\n"
+        "Checks each WhatsApp number via <b>WhatsApp’s real API</b>\n"
+        "simultaneously — accurate per-number results.\n\n"
         "<b>Detects:</b>\n"
-        "  🟢 Active — not banned\n"
-        "  🔴 Banned — with type:\n"
-        "       🔒 Personal  |  🌍 Regional  |  👮 Admin\n"
-        "  ⚫ Not registered on WhatsApp\n\n"
+        "  🟢 Active  •  🔴 Banned  •  ⚫ Not Registered\n"
+        "  Ban types: 🔒 Personal  🌍 Regional  👮 Admin\n\n"
         "━" * 26 + "\n"
         "  <code>!check +2348012345678</code>\n"
         "  <code>!check 234xxx 447xxx 155xxx</code>\n"
         "  <code>!ping</code>  │  <code>!help</code>\n"
         "━" * 26 + "\n"
-        f"⚡ Up to <b>{MAX_NUMBERS}</b> numbers checked at once!"
+        f"⚡ Up to <b>{MAX_NUMBERS}</b> numbers simultaneously!"
     )
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("📖 Help",  callback_data="cb_help"),
@@ -458,9 +468,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
         "⚡ <b>KAGE X — Commands</b>\n\n"
-        "<code>!check +234xxxxxxxx</code> — check one\n"
+        "<code>!check +234xxxxxxxx</code> — single\n"
         "<code>!check 234xxx 447xxx 155xxx</code> — multi\n"
-        "<code>!ping</code> — bot latency\n"
+        "<code>!ping</code> — latency\n"
         "<code>!about</code> — bot info\n\n"
         f"⚡ Max <b>{MAX_NUMBERS}</b> numbers per request."
     )
@@ -471,12 +481,11 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
         "╔" + "═" * 34 + "╗\n"
-        f"║  ⚡ <b>{BOT_NAME}</b>  {BOT_VERSION}  ║\n"
+        f"║  ⚡ <b>{BOT_NAME}</b>  {BOT_VERSION}      ║\n"
         "╚" + "═" * 34 + "╝\n\n"
-        "🔍 Uses WhatsApp’s real internal API\n"
+        "🔍 Real WhatsApp API detection\n"
         "⚡ Simultaneous per-number checking\n"
         "🎯 Detects Personal, Regional & Admin bans\n"
-        "🌎 Uses <code>phonenumbers</code> for accurate parsing\n"
         "🌐 Global prefix: <code>!</code>"
     )
     msg = update.message or update.callback_query.message
@@ -500,16 +509,17 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if not numbers:
         await update.message.reply_text(
-            "⚠️ <b>No valid numbers found!</b>\n\n"
-            "Usage: <code>!check +2348012345678</code>\n"
-            "Multi:  <code>!check 2348012345678 447911234567</code>",
+            "⚠️ <b>No valid numbers detected.</b>\n\n"
+            "Send numbers with country code:\n"
+            "  <code>!check +2348012345678</code>\n"
+            "  <code>!check 2348012345678 447911234567</code>",
             parse_mode=ParseMode.HTML,
         )
         return
 
     wait = await update.message.reply_text(
         f"⏳ <b>KAGE X</b> — Checking <code>{len(numbers)}</code> "
-        f"number(s) via WhatsApp API... ✨",
+        "number(s) via WhatsApp API... ✨",
         parse_mode=ParseMode.HTML,
     )
 
@@ -542,7 +552,7 @@ async def handle_prefix(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await fn(update, ctx)
     else:
         await update.message.reply_text(
-            f"❓ Unknown command: <code>!{cmd}</code> — try <code>!help</code>",
+            f"❓ Unknown: <code>!{cmd}</code> — try <code>!help</code>",
             parse_mode=ParseMode.HTML,
         )
 
@@ -558,9 +568,9 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
     print(f"[KAGE X ERROR] {ctx.error}")
 
 
-# ═══════════════════════════════════════════════════════
+# ----------------------------------------------------------------
 #  MAIN
-# ═══════════════════════════════════════════════════════
+# ----------------------------------------------------------------
 
 def main():
     token = BOT_TOKEN.strip()
@@ -579,10 +589,10 @@ def main():
     app.add_error_handler(on_error)
 
     print(
-        "\n" + "╔" + "═" * 44 + "╗" +
-        "\n║   ⚡  " + BOT_NAME + "  ⚡  " + BOT_VERSION + "         ║" +
-        "\n║   Real WhatsApp API Engine — Running...        ║" +
-        "\n╚" + "═" * 44 + "╝\n"
+        "\n" + "╔" + "═" * 46 + "╗" +
+        "\n║   ⚡  " + BOT_NAME + "  ⚡  " + BOT_VERSION + "           ║" +
+        "\n║   Real WhatsApp API — No False Invalids — Live  ║" +
+        "\n╚" + "═" * 46 + "╝\n"
     )
     app.run_polling(drop_pending_updates=True)
 
