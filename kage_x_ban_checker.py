@@ -26,7 +26,7 @@ from telegram.constants import ParseMode
 #  CONFIG  —  Replace with your bot token
 # ─────────────────────────────────────────────
 import os
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")     # @BotFather token
+BOT_TOKEN = os.getenv("8826362937:AAG89LviTfj_iSrcH1eJ2A5dIm6XhK8R5TU")     # @BotFather token
 BOT_NAME    = "KAGE X Ban Checker"
 BOT_VERSION = "v1.0"
 PREFIX      = "!"
