@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-KAGE X Ban Checker  —  Telegram Bot v5.0
-WhatsApp number status checker.
-Prefix: !   |   Simultaneous   |   Personal / Regional / Admin
+KAGE X Ban Checker  v6.0
+WhatsApp ban checker — cloud-server-safe, multi-signal detection.
+Prefix: !  |  Simultaneous  |  Personal / Regional / Admin
 """
 
 import os, asyncio, aiohttp, re, time, random, string, json
@@ -14,20 +14,19 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════
 #  CONFIG
-# ─────────────────────────────────────────────────────────────
-BOT_TOKEN   = os.getenv("BOT_TOKEN", "")
-BOT_NAME    = "KAGE X Ban Checker"
-BOT_VERSION = "v5.0"
-PREFIX      = "!"
-MAX_NUM     = 20
+# ═══════════════════════════════════════════════════
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_NAME  = "KAGE X Ban Checker"
+BOT_VER   = "v6.0"
+PREFIX    = "!"
+MAX_NUM   = 20
 
-# ─────────────────────────────────────────────────────────────
-#  NUMBER PARSING  — accepts ANY real-looking number, no rejections
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════
+#  NUMBER UTILITIES
+# ═══════════════════════════════════════════════════
 
-# Ordered longest-first so we match the most specific CC first
 CC_TABLE = sorted({
     "1","7","20","27","30","31","32","33","34","36","39","40","41",
     "43","44","45","46","47","48","49","51","52","53","54","55","56",
@@ -52,307 +51,404 @@ CC_TABLE = sorted({
 }, key=len, reverse=True)
 
 
-def get_cc_nn(digits: str):
-    """
-    Split digits into (country_code, national_number).
-    Never fails for 7-15 digit strings.
-    """
+def split_cc(digits: str):
     for cc in CC_TABLE:
         if digits.startswith(cc) and len(digits) - len(cc) >= 4:
             return cc, digits[len(cc):]
-    # Fallback: try 1/2/3-digit split
-    for clen in (1, 2, 3):
-        if len(digits) > clen + 3:
-            return digits[:clen], digits[clen:]
+    for n in (1, 2, 3):
+        if len(digits) > n + 3:
+            return digits[:n], digits[n:]
     return digits[:1], digits[1:]
 
 
-def clean(raw: str) -> str:
-    """Strip everything except digits."""
-    return re.sub(r"\D", "", raw.strip())
+def only_digits(s: str) -> str:
+    return re.sub(r"\D", "", s.strip())
 
 
-def extract_numbers(text: str) -> list:
-    """Extract unique 7-15 digit numbers from free text."""
-    tokens = re.split(r"[\s,;|\n]+", text.strip())
+def parse_numbers(text: str) -> list:
     seen, out = set(), []
-    for t in tokens:
-        d = clean(t)
+    for tok in re.split(r"[\s,;|\n]+", text.strip()):
+        d = only_digits(tok)
         if 7 <= len(d) <= 15 and d not in seen:
-            seen.add(d)
-            out.append(d)
+            seen.add(d); out.append(d)
     return out[:MAX_NUM]
 
 
-# ─────────────────────────────────────────────────────────────
-#  WHATSAPP CHECK ENGINE  (two independent methods)
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════
+#  DETECTION ENGINE
+# ═══════════════════════════════════════════════════
 
-WA_EXIST    = "https://v.whatsapp.net/v2/exist"
-WA_WEB      = "https://api.whatsapp.com/send"
-WA_ME       = "https://wa.me/"
+# Rotate between multiple realistic mobile + desktop UAs
+USER_AGENTS = [
+    # Android Chrome
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    # iPhone Safari
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+    # Desktop Chrome
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    # Samsung Browser
+    "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/24.0 Chrome/117.0.0.0 Mobile Safari/537.36",
+]
 
-WA_UAS = [
+WA_CLIENT_UAS = [
+    "WhatsApp/2.24.10.84 A",
     "WhatsApp/2.24.8.78 A",
     "WhatsApp/2.24.6.77 A",
     "WhatsApp/2.23.25.84 A",
-    "WhatsApp/2.24.10.84 A",
 ]
-BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
 
 
-def _rand(n=16):
+def _ua(mobile=True):
+    pool = USER_AGENTS[:2] if mobile else USER_AGENTS
+    return random.choice(pool)
+
+
+def _rid(n=16):
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
 
-# --- Method A: WhatsApp internal exist API ---
-
-async def _method_a(session, cc, nn):
-    """
-    Returns dict with keys: status, reason, http
-    status: "active" | "banned" | "not_registered" | "rate_limited" | "error" | None
-    """
-    params = {"cc": cc, "phone": nn, "id": _rand(), "lg": "en", "lc": "US"}
-    headers = {"User-Agent": random.choice(WA_UAS), "Accept": "*/*"}
+async def _get(session, url, *, params=None, headers=None, timeout=10):
+    """Fetch URL. Returns (status_code, body_lower, final_url) or (-1,'','') on error."""
     try:
         async with session.get(
-            WA_EXIST, params=params, headers=headers,
-            timeout=aiohttp.ClientTimeout(total=10),
+            url, params=params, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=timeout),
             ssl=False, allow_redirects=True,
         ) as r:
-            http = r.status
-            try:
-                body = await r.json(content_type=None)
-            except Exception:
-                raw = await r.text(errors="ignore")
-                try:
-                    body = json.loads(raw)
-                except Exception:
-                    body = {}
-
-            s  = str(body.get("status",  "")).lower()
-            rs = str(body.get("result",  "")).lower()
-            rn = str(body.get("reason",  "")).lower()
-
-            # active signals
-            if s == "ok" or rs in ("exist", "ok", "1", "true"):
-                return {"status": "active", "reason": rs, "http": http}
-
-            # explicit ban
-            if rn in ("blocked", "banned", "gone", "suspended", "disabled"):
-                return {"status": "banned", "reason": rn, "http": http}
-
-            # not registered
-            if rn in ("unregistered", "not_exist", "nonexistent", "missing"):
-                return {"status": "not_registered", "reason": rn, "http": http}
-
-            # bad params
-            if rn in ("bad_param", "country-code-invalid", "enum_mismatch"):
-                return {"status": "param_error", "reason": rn, "http": http}
-
-            # rate limited
-            if rn in ("too_recent", "try_later") or http == 429:
-                return {"status": "rate_limited", "reason": rn, "http": http}
-
-            # HTTP-code fallback
-            if http in (401, 403):
-                return {"status": "banned", "reason": "http_403", "http": http}
-            if http == 404:
-                return {"status": "not_registered", "reason": "http_404", "http": http}
-            if http == 200:
-                # 200 but no clear JSON signal — check raw text
-                raw = json.dumps(body).lower()
-                if any(w in raw for w in ("exist", "login", "\"ok\"")):
-                    return {"status": "active", "reason": "200_text", "http": http}
-
-            return {"status": None, "reason": rn or str(http), "http": http}
-
+            body = (await r.text(errors="ignore")).lower()
+            return r.status, body, str(r.url)
     except asyncio.TimeoutError:
-        return {"status": "timeout", "reason": "timeout", "http": 0}
-    except Exception as e:
-        return {"status": "error", "reason": str(e)[:80], "http": 0}
-
-
-# --- Method B: wa.me & api.whatsapp.com page check ---
-
-async def _method_b(session, digits):
-    """
-    Browser-based check.
-    Returns: "active" | "not_registered" | "banned" | None
-    """
-    headers = {"User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"}
-    status = None
-
-    # wa.me check
-    try:
-        async with session.get(
-            WA_ME + digits, headers=headers,
-            timeout=aiohttp.ClientTimeout(total=8),
-            ssl=False, allow_redirects=True,
-        ) as r:
-            body = (await r.text(errors="ignore")).lower()
-            if any(w in body for w in (
-                "send message", "open whatsapp", "chat with",
-                "message this number", "whatsapp://", "wa.me/",
-            )):
-                status = "active"
-            elif any(w in body for w in (
-                "phone number shared via url is invalid",
-                "not on whatsapp",
-                "number is not registered",
-                "this link is not valid",
-                "invalid link",
-            )):
-                status = "not_registered"
-            elif any(w in body for w in (
-                "this account has been banned",
-                "account banned",
-                "number is banned",
-            )):
-                status = "banned"
+        return -2, "", ""
     except Exception:
-        pass
+        return -1, "", ""
 
-    if status:
-        return status
 
-    # api.whatsapp.com/send check
+# ---- Signal helpers ----------------------------------------------------------
+
+_ACTIVE_KW   = [
+    "send message", "open whatsapp", "continue to chat",
+    "chat with", "message this contact", "whatsapp://send",
+    "click to chat", "start chat", "wa.me/",
+    "\"phone\":", "phoneNumber", "send_message",
+    "og:title\">whatsapp", # og meta
+]
+_BANNED_KW   = [
+    "this account has been banned",
+    "account has been banned",
+    "number is banned",
+    "your account has been banned",
+    "this phone number is banned",
+    "account banned from whatsapp",
+    "banned for violating",
+]
+_NOREG_KW    = [
+    "phone number shared via url is invalid",
+    "this link is not valid",
+    "not on whatsapp",
+    "number is not registered",
+    "invalid phone number",
+    "no whatsapp account",
+    "doesn't have whatsapp",
+    "does not have whatsapp",
+]
+_REGIONAL_KW = [
+    "not available in your country",
+    "not available in your region",
+    "country is not supported",
+    "service not available in",
+    "unavailable in your region",
+]
+_ADMIN_KW    = [
+    "terms of service", "policy violation",
+    "violated our terms", "enforcement action",
+    "reported for spam", "abuse",
+]
+
+
+def _scan(body):
+    """Scan page body. Returns 'active'|'banned'|'not_registered'|None."""
+    for kw in _ACTIVE_KW:
+        if kw in body:
+            return "active"
+    for kw in _BANNED_KW:
+        if kw in body:
+            return "banned"
+    for kw in _NOREG_KW:
+        if kw in body:
+            return "not_registered"
+    return None
+
+
+def _ban_type_from_body(body, http_code):
+    if http_code == 403:
+        return "Admin"
+    for kw in _REGIONAL_KW:
+        if kw in body:
+            return "Regional"
+    for kw in _ADMIN_KW:
+        if kw in body:
+            return "Admin"
+    return "Personal"
+
+
+# ---- Method 1: WhatsApp internal exist API ----------------------------------
+
+async def _m1_exist_api(session, cc, nn):
+    """
+    WhatsApp v2/exist endpoint — official internal check.
+    Returns 'active'|'banned'|'not_registered'|'rate_limited'|None
+    """
+    params  = {"cc": cc, "phone": nn, "id": _rid(), "lg": "en", "lc": "US"}
+    headers = {"User-Agent": random.choice(WA_CLIENT_UAS), "Accept": "*/*"}
+    code, body, _ = await _get(
+        session, "https://v.whatsapp.net/v2/exist",
+        params=params, headers=headers,
+    )
+    if code < 0:
+        return None  # unreachable from this IP
+
     try:
-        async with session.get(
-            WA_WEB, params={"phone": digits}, headers=headers,
-            timeout=aiohttp.ClientTimeout(total=8),
-            ssl=False, allow_redirects=True,
-        ) as r:
-            body = (await r.text(errors="ignore")).lower()
-            if any(w in body for w in (
-                "send message", "open whatsapp", "continue to chat",
-            )):
-                return "active"
-            elif any(w in body for w in (
-                "not registered", "invalid", "not on whatsapp",
-            )):
-                return "not_registered"
-            elif any(w in body for w in (
-                "banned", "blocked", "suspended",
-            )):
-                return "banned"
+        data = json.loads(body)
     except Exception:
-        pass
+        data = {}
+
+    s  = str(data.get("status",  "")).lower()
+    rs = str(data.get("result",  "")).lower()
+    rn = str(data.get("reason",  "")).lower()
+
+    if s == "ok" or rs in ("exist", "ok"):
+        return "active"
+    if rn in ("blocked", "banned", "gone", "suspended", "disabled"):
+        return "banned"
+    if rn in ("unregistered", "not_exist", "nonexistent", "missing"):
+        return "not_registered"
+    if rn in ("too_recent", "try_later") or code == 429:
+        return "rate_limited"
+    if code in (401, 403):
+        return "banned"
+    if code == 404:
+        return "not_registered"
+    # Last-resort body scan
+    return _scan(body)
+
+
+# ---- Method 2: wa.me with mobile UA -----------------------------------------
+
+async def _m2_wame(session, digits):
+    """
+    wa.me/{digits} page check with mobile user agent.
+    Returns 'active'|'banned'|'not_registered'|None
+    """
+    headers = {
+        "User-Agent": _ua(mobile=True),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+        "Cache-Control": "no-cache",
+    }
+    code, body, final_url = await _get(
+        session, f"https://wa.me/{digits}",
+        headers=headers, timeout=10,
+    )
+    if code < 0:
+        return None
+
+    # Redirect to intent or whatsapp:// = active on mobile
+    if "whatsapp://" in final_url or "intent://" in final_url:
+        return "active"
+
+    result = _scan(body)
+    if result:
+        return result
+
+    # Check og:title specifically
+    og = re.search(r'og:title["\s]+content=["\']([^"\']+)', body)
+    if og:
+        t = og.group(1).lower()
+        if "whatsapp" in t and any(c.isdigit() for c in t):
+            return "active"
 
     return None
 
 
-# --- Ban type classifier ---
+# ---- Method 3: api.whatsapp.com/send ----------------------------------------
 
-async def _ban_type(session, digits):
-    """Classify ban as Admin, Regional, or Personal."""
-    headers = {"User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"}
+async def _m3_api_send(session, digits):
+    """
+    api.whatsapp.com/send?phone= page check.
+    Returns 'active'|'banned'|'not_registered'|None
+    """
+    headers = {
+        "User-Agent": _ua(mobile=False),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.google.com/",
+    }
+    code, body, _ = await _get(
+        session, "https://api.whatsapp.com/send",
+        params={"phone": digits}, headers=headers, timeout=10,
+    )
+    if code < 0:
+        return None
+    if code == 403:
+        return "banned"  # API-level block
+    return _scan(body)
+
+
+# ---- Method 4: click.whatsapp.com shortlink ---------------------------------
+
+async def _m4_click(session, digits):
+    """
+    click.whatsapp.com/send?phone= — alternative endpoint less likely to be blocked.
+    Returns 'active'|'not_registered'|None
+    """
+    headers = {
+        "User-Agent": _ua(mobile=True),
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    code, body, final_url = await _get(
+        session, "https://click.whatsapp.com/send",
+        params={"phone": digits}, headers=headers, timeout=10,
+    )
+    if code < 0:
+        return None
+    if "whatsapp://" in final_url:
+        return "active"
+    return _scan(body)
+
+
+# ---- Method 5: wa.me short redirect analysis --------------------------------
+
+async def _m5_redirect(session, digits):
+    """
+    Check redirect chain of wa.me to determine registration.
+    If WA redirects to a proper send page → active.
+    If WA shows error page → not_registered.
+    """
+    headers = {
+        "User-Agent": _ua(mobile=True),
+        "Accept": "text/html,*/*",
+    }
     try:
+        # Don't follow redirects so we see the redirect target
         async with session.get(
-            WA_WEB, params={"phone": digits}, headers=headers,
+            f"https://wa.me/{digits}",
+            headers=headers,
             timeout=aiohttp.ClientTimeout(total=8),
-            ssl=False, allow_redirects=True,
+            ssl=False,
+            allow_redirects=False,
         ) as r:
-            if r.status == 403:
-                return "Admin"
-            body = (await r.text(errors="ignore")).lower()
-            if any(w in body for w in (
-                "not available in your country", "not available in your region",
-                "service not available", "country is not supported",
-            )):
-                return "Regional"
-            if any(w in body for w in (
-                "terms of service", "policy violation", "enforcement",
-                "violated our", "spam", "abuse",
-            )):
-                return "Admin"
+            loc = r.headers.get("Location", "").lower()
+            if "send" in loc or "whatsapp" in loc or "chat" in loc:
+                return "active"
+            if "invalid" in loc or "error" in loc:
+                return "not_registered"
     except Exception:
         pass
-    return "Personal"
+    return None
 
 
-# --- Master check function ---
+# ---- Ban type classifier ----------------------------------------------------
+
+async def _classify_ban(session, digits):
+    """Determine ban type: Admin, Regional, or Personal."""
+    headers = {"User-Agent": _ua(), "Accept-Language": "en-US,en;q=0.9"}
+    code, body, _ = await _get(
+        session, "https://api.whatsapp.com/send",
+        params={"phone": digits}, headers=headers, timeout=8,
+    )
+    return _ban_type_from_body(body, code)
+
+
+# ---- Master checker ---------------------------------------------------------
 
 async def check_one(session, digits: str) -> dict:
-    cc, nn  = get_cc_nn(digits)
+    cc, nn  = split_cc(digits)
     display = "+" + digits
     t0      = time.monotonic()
 
-    # Run both methods concurrently
-    a_task = asyncio.create_task(_method_a(session, cc, nn))
-    b_task = asyncio.create_task(_method_b(session, digits))
-    a, b   = await asyncio.gather(a_task, b_task)
+    # Run all 5 methods simultaneously
+    r1, r2, r3, r4, r5 = await asyncio.gather(
+        _m1_exist_api(session, cc, nn),
+        _m2_wame(session, digits),
+        _m3_api_send(session, digits),
+        _m4_click(session, digits),
+        _m5_redirect(session, digits),
+        return_exceptions=True,
+    )
+
+    # Normalize exception results
+    signals = []
+    for sig in (r1, r2, r3, r4, r5):
+        if isinstance(sig, Exception) or sig is None:
+            continue
+        signals.append(sig)
 
     ping_ms = round((time.monotonic() - t0) * 1000)
 
-    a_status = a.get("status")
-    a_reason = a.get("reason", "")
+    # ── Decision logic ──────────────────────────────────────────────
+    counts = {
+        "active":         signals.count("active"),
+        "banned":         signals.count("banned"),
+        "not_registered": signals.count("not_registered"),
+        "rate_limited":   signals.count("rate_limited"),
+    }
 
-    # ── Decide final status ─────────────────────────────────
-    # Priority: if either method says active, trust it
-    if a_status == "active" or b == "active":
-        return {"display": display, "status": "active",
-                "ban_type": None, "ping_ms": ping_ms, "note": ""}
+    total_signals = len(signals)
 
-    # Both agree: banned
-    if a_status == "banned" or b == "banned":
-        ban_type = await _ban_type(session, digits)
-        note = f"API reason: {a_reason}" if a_reason and a_reason not in ("http_403",) else ""
-        return {"display": display, "status": "banned",
-                "ban_type": ban_type, "ping_ms": ping_ms, "note": note}
+    # Any ban signal from official API (method 1) is authoritative
+    if r1 == "banned":
+        ban_type = await _classify_ban(session, digits)
+        return _res(display, "banned", ban_type, ping_ms, "API confirmed")
 
-    # Not registered
-    if a_status == "not_registered" or b == "not_registered":
-        return {"display": display, "status": "not_registered",
-                "ban_type": None, "ping_ms": ping_ms, "note": ""}
+    if r1 == "not_registered":
+        return _res(display, "not_registered", None, ping_ms, "")
 
-    # Param error from API — likely our CC split is off; still attempt B result
-    if a_status == "param_error":
-        if b == "active":
-            return {"display": display, "status": "active",
-                    "ban_type": None, "ping_ms": ping_ms, "note": ""}
-        if b == "not_registered":
-            return {"display": display, "status": "not_registered",
-                    "ban_type": None, "ping_ms": ping_ms, "note": ""}
-        # B gave nothing  — re-try API with alternate CC split
-        for clen in (1, 2, 3):
-            if str(len(cc)) != str(clen):
-                alt_cc = digits[:clen]
-                alt_nn = digits[clen:]
-                retry  = await _method_a(session, alt_cc, alt_nn)
-                if retry.get("status") in ("active", "banned", "not_registered"):
-                    rs = retry["status"]
-                    bt = None
-                    if rs == "banned":
-                        bt = await _ban_type(session, digits)
-                    return {"display": display, "status": rs,
-                            "ban_type": bt, "ping_ms": ping_ms,
-                            "note": f"Retry CC len {clen}"}
+    # Active: if ANY method confirms active, trust it
+    if counts["active"] >= 1:
+        return _res(display, "active", None, ping_ms, "")
+
+    # Banned: if 2+ methods agree, confident
+    if counts["banned"] >= 2:
+        ban_type = await _classify_ban(session, digits)
+        return _res(display, "banned", ban_type, ping_ms, f"{counts['banned']}/5 signals")
+
+    # Banned: even 1 signal from web methods
+    if counts["banned"] == 1:
+        ban_type = await _classify_ban(session, digits)
+        return _res(display, "banned", ban_type, ping_ms, "1 signal detected")
+
+    # Not registered: majority agree
+    if counts["not_registered"] >= 2:
+        return _res(display, "not_registered", None, ping_ms, "")
+
+    if counts["not_registered"] == 1:
+        return _res(display, "not_registered", None, ping_ms, "")
 
     # Rate limited
-    if a_status == "rate_limited":
-        return {"display": display, "status": "rate_limited",
-                "ban_type": None, "ping_ms": ping_ms,
-                "note": "WhatsApp rate limit — try again shortly"}
+    if counts["rate_limited"] >= 1:
+        return _res(display, "rate_limited", None, ping_ms,
+                    "WhatsApp throttled — try again in 1 min")
 
-    # Timeout / error
-    if a_status in ("timeout", "error"):
-        return {"display": display, "status": a_status,
-                "ban_type": None, "ping_ms": ping_ms, "note": a_reason}
+    # All methods unreachable (server IP fully blocked by WA)
+    if total_signals == 0:
+        return _res(display, "blocked_ip", None, ping_ms,
+                    "WA blocked server IP — check from personal device")
 
-    # Final fallback: unknown
-    return {"display": display, "status": "unknown",
-            "ban_type": None, "ping_ms": ping_ms,
-            "note": "Could not determine — no clear API signal"}
+    # Partial signals but inconclusive
+    return _res(display, "unknown", None, ping_ms,
+                f"Weak signal ({total_signals} methods responded)")
+
+
+def _res(display, status, ban_type, ping_ms, note):
+    return {"display": display, "status": status,
+            "ban_type": ban_type, "ping_ms": ping_ms, "note": note}
 
 
 async def check_all(numbers: list) -> list:
-    connector = aiohttp.TCPConnector(limit=60, ssl=False, ttl_dns_cache=300)
-    async with aiohttp.ClientSession(connector=connector) as sess:
+    conn = aiohttp.TCPConnector(limit=60, ssl=False, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(connector=conn) as sess:
         results = await asyncio.gather(
             *[check_one(sess, n) for n in numbers],
             return_exceptions=True,
@@ -360,28 +456,27 @@ async def check_all(numbers: list) -> list:
     out = []
     for i, r in enumerate(results):
         if isinstance(r, Exception):
-            out.append({"display": "+" + numbers[i], "status": "error",
-                        "ban_type": None, "ping_ms": 0, "note": str(r)[:80]})
+            out.append(_res("+" + numbers[i], "error", None, 0, str(r)[:80]))
         else:
             out.append(r)
     return out
 
 
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════
 #  FORMATTERS
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════
 
-STATUS_LABEL = {
+STATUS_LBL = {
     "active":         ("🟢", "ACTIVE — Not Banned"),
     "banned":         ("🔴", "BANNED"),
     "not_registered": ("⚫", "NOT ON WHATSAPP"),
     "rate_limited":   ("⏳", "RATE LIMITED — Retry soon"),
+    "blocked_ip":     ("🟠", "SERVER IP BLOCKED BY WA"),
     "timeout":        ("🟡", "TIMEOUT"),
     "error":          ("❌", "ERROR"),
-    "unknown":        ("❓", "UNDETERMINED"),
+    "unknown":        ("❓", "WEAK SIGNAL"),
 }
-
-BAN_LABEL = {
+BAN_LBL = {
     "Admin":    "👮 Admin Ban",
     "Regional": "🌍 Regional Ban",
     "Personal": "🔒 Personal Ban",
@@ -398,7 +493,7 @@ def build_msg(results, elapsed, requester):
 
     lines = [
         "╔" + "═" * 38 + "╗",
-        "║   ⚡  <b>KAGE X Ban Checker</b>  ⚡  v5.0  ║",
+        "║   ⚡  <b>KAGE X Ban Checker</b>  ⚡  v6.0  ║",
         f"║   🗓 {now:<31}║",
         "╚" + "═" * 38 + "╝",
         "",
@@ -408,13 +503,12 @@ def build_msg(results, elapsed, requester):
         f"   • 🟢 Active  : <code>{active}</code>",
         f"   • Other    : <code>{other}</code>",
         f"   • ⏱ Speed   : <code>{elapsed:.2f}s</code>",
-        "",
-        div, "",
+        "", div, "",
     ]
 
     for i, r in enumerate(results, 1):
-        icon, lbl = STATUS_LABEL.get(r["status"], ("❓", r["status"].upper()))
-        bt        = BAN_LABEL.get(r.get("ban_type"), "") if r.get("ban_type") else ""
+        icon, lbl = STATUS_LBL.get(r["status"], ("❓", r["status"].upper()))
+        bt = BAN_LBL.get(r.get("ban_type"), "") if r.get("ban_type") else ""
         lines.append(f"<b>#{i}</b>  {icon}  <code>{r['display']}</code>")
         lines.append(f"      Status   : <b>{lbl}</b>")
         if bt:
@@ -428,19 +522,19 @@ def build_msg(results, elapsed, requester):
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────
-#  HANDLERS
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════
+#  TELEGRAM HANDLERS
+# ═══════════════════════════════════════════════════
 
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    name = update.effective_user.first_name
+async def cmd_start(u: Update, _):
+    name = u.effective_user.first_name
     msg  = (
         "╔" + "═" * 38 + "╗\n"
-        "║   ⚡  <b>KAGE X Ban Checker</b>  ⚡  v5.0  ║\n"
+        "║   ⚡  <b>KAGE X Ban Checker</b>  ⚡  v6.0  ║\n"
         "╚" + "═" * 38 + "╝\n\n"
         f"👋 Welcome, <b>{name}</b>!\n\n"
-        "Checks every WhatsApp number via <b>dual-method API</b>\n"
-        "simultaneously — accurate, per-number results.\n\n"
+        "5-method simultaneous WhatsApp detection.\n"
+        "Every number gets its own accurate result.\n\n"
         "<b>Results:</b>\n"
         "  🟢 Active  •  🔴 Banned  •  ⚫ Not Registered\n"
         "  Ban types: 🔒 Personal  🌍 Regional  👮 Admin\n\n"
@@ -455,53 +549,51 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("📖 Help",  callback_data="help"),
         InlineKeyboardButton("ℹ️ About", callback_data="about"),
     ]])
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await u.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_help(u: Update, _):
     msg = (
         "⚡ <b>KAGE X — Commands</b>\n\n"
-        "<code>!check +234xxxxxxxx</code> — single check\n"
-        "<code>!check 234xxx 447xxx</code> — multi check\n"
+        "<code>!check +234xxxxxxxx</code> — single\n"
+        "<code>!check 234xxx 447xxx</code> — multi\n"
         "<code>!ping</code> — latency\n"
         "<code>!about</code> — bot info\n\n"
         f"⚡ Max <b>{MAX_NUM}</b> numbers per request."
     )
-    target = update.message or update.callback_query.message
+    target = u.message or u.callback_query.message
     await target.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
-async def cmd_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_about(u: Update, _):
     msg = (
         "╔" + "═" * 34 + "╗\n"
-        f"║  ⚡ <b>{BOT_NAME}</b>  {BOT_VERSION}  ║\n"
+        f"║  ⚡ <b>{BOT_NAME}</b>  {BOT_VER}     ║\n"
         "╚" + "═" * 34 + "╝\n\n"
-        "🔍 Dual-method WhatsApp detection\n"
-        "⚡ Simultaneous per-number checking\n"
+        "🔍 5-method WhatsApp detection\n"
+        "⚡ All methods run simultaneously\n"
         "🎯 Detects Personal, Regional & Admin bans\n"
         "🌐 Global prefix: <code>!</code>"
     )
-    target = update.message or update.callback_query.message
+    target = u.message or u.callback_query.message
     await target.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
-async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_ping(u: Update, _):
     t0  = time.monotonic()
-    msg = await update.message.reply_text("🏓 Pinging...")
+    msg = await u.message.reply_text("🏓 Pinging...")
     ms  = round((time.monotonic() - t0) * 1000)
-    await msg.edit_text(
-        f"🏓 <b>Pong!</b>\n⚡ Latency: <code>{ms} ms</code>",
-        parse_mode=ParseMode.HTML,
-    )
+    await msg.edit_text(f"🏓 <b>Pong!</b>\n⚡ Latency: <code>{ms} ms</code>",
+                        parse_mode=ParseMode.HTML)
 
 
-async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    args_text = " ".join(ctx.args) if ctx.args else ""
-    numbers   = extract_numbers(args_text)
-    user      = update.effective_user
+async def cmd_check(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    args   = " ".join(ctx.args) if ctx.args else ""
+    nums   = parse_numbers(args)
+    user   = u.effective_user
 
-    if not numbers:
-        await update.message.reply_text(
+    if not nums:
+        await u.message.reply_text(
             "⚠️ <b>No numbers found.</b>\n\n"
             "Include country code:\n"
             "  <code>!check +2348012345678</code>\n"
@@ -510,75 +602,65 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    wait = await update.message.reply_text(
-        f"⏳ Checking <code>{len(numbers)}</code> number(s) via dual-method API... ✨",
+    wait = await u.message.reply_text(
+        f"⏳ Checking <code>{len(nums)}</code> number(s) using 5-method engine... ✨",
         parse_mode=ParseMode.HTML,
     )
     t0      = time.monotonic()
-    results = await check_all(numbers)
+    results = await check_all(nums)
     elapsed = time.monotonic() - t0
-
-    requester = f"@{user.username}" if user.username else user.first_name
+    req     = f"@{user.username}" if user.username else user.first_name
     await wait.delete()
-    await update.message.reply_text(
-        build_msg(results, elapsed, requester),
-        parse_mode=ParseMode.HTML,
-    )
+    await u.message.reply_text(build_msg(results, elapsed, req),
+                               parse_mode=ParseMode.HTML)
 
 
-async def on_prefix(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
+async def on_prefix(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (u.message.text or "").strip()
     if not text.startswith(PREFIX):
         return
     parts    = text[len(PREFIX):].split(None, 1)
     cmd      = parts[0].lower() if parts else ""
     ctx.args = parts[1].split() if len(parts) > 1 else []
-    await {
-        "check": cmd_check, "start": cmd_start,
-        "help":  cmd_help,  "about": cmd_about,
-        "ping":  cmd_ping,
-    }.get(cmd, _unknown)(update, ctx)
+    fn = {"check": cmd_check, "start": cmd_start,
+          "help":  cmd_help,  "about": cmd_about,
+          "ping":  cmd_ping}.get(cmd)
+    if fn:
+        await fn(u, ctx)
+    else:
+        await u.message.reply_text(
+            f"❓ Unknown: <code>!{cmd}</code> — try <code>!help</code>",
+            parse_mode=ParseMode.HTML,
+        )
 
 
-async def _unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").split()[0].lstrip(PREFIX)
-    await update.message.reply_text(
-        f"❓ Unknown: <code>!{text}</code> — try <code>!help</code>",
-        parse_mode=ParseMode.HTML,
-    )
+async def on_cb(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; await q.answer()
+    if q.data == "help":  await cmd_help(u, ctx)
+    elif q.data == "about": await cmd_about(u, ctx)
 
 
-async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if q.data == "help":  await cmd_help(update, ctx)
-    elif q.data == "about": await cmd_about(update, ctx)
+async def on_err(update, ctx): print(f"[ERR] {ctx.error}")
 
 
-async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
-    print(f"[KAGE X ERR] {ctx.error}")
-
-
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════
 #  MAIN
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════
 
 def main():
     token = BOT_TOKEN.strip()
     if not token:
         print("⚠️  BOT_TOKEN not set."); return
-
     app = Application.builder().token(token).build()
-    for cmd, fn in [("start", cmd_start), ("help", cmd_help),
-                    ("about", cmd_about), ("ping", cmd_ping), ("check", cmd_check)]:
-        app.add_handler(CommandHandler(cmd, fn))
+    for c, f in [("start", cmd_start),("help", cmd_help),
+                 ("about", cmd_about),("ping", cmd_ping),("check", cmd_check)]:
+        app.add_handler(CommandHandler(c, f))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_prefix))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_error_handler(on_error)
-
-    print(f"╔{'='*46}╗")
-    print(f"║  ⚡  {BOT_NAME}  ⚡  {BOT_VERSION}  ║")
-    print(f"║  Dual-Method Engine — Running...              ║")
+    app.add_handler(CallbackQueryHandler(on_cb))
+    app.add_error_handler(on_err)
+    print(f"\n╔{'='*46}╗")
+    print(f"║  ⚡  {BOT_NAME}  {BOT_VER}  ║")
+    print(f"║  5-Method Engine — Running...                 ║")
     print(f"╚{'='*46}╝\n")
     app.run_polling(drop_pending_updates=True)
 
