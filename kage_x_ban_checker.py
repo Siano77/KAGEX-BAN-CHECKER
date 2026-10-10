@@ -113,15 +113,41 @@ def parse_numbers(text: str) -> list:
     return out[:MAX_NUM]
 
 
-async def send_banner(target) -> None:
-    """Send banner image. Logs real errors; never crashes a command."""
-    fid = get_banner()
+CAPTION_LIMIT = 950  # Telegram caption hard-limit is 1024; stay safe
+
+async def send_with_banner(target, text: str,
+                           parse_mode=ParseMode.HTML,
+                           reply_markup=None) -> None:
+    """
+    Send image + text in ONE message bubble (photo+caption), exactly like Sanctum.
+    Falls back gracefully: if no banner just sends text; if text too long sends
+    photo first then text separately.
+    """
+    fid  = get_banner()
+    kw   = {"parse_mode": parse_mode}
+    if reply_markup:
+        kw["reply_markup"] = reply_markup
+
     if not fid:
+        await target.reply_text(text, **kw)
         return
+
+    # Strip <blockquote> tags — not supported in captions
+    caption = text.replace("<blockquote>", "").replace("</blockquote>", "")
+
+    if len(caption) <= CAPTION_LIMIT:
+        try:
+            await target.reply_photo(photo=fid, caption=caption, **kw)
+            return
+        except Exception as e:
+            print(f"[BANNER+CAPTION ERROR] {type(e).__name__}: {e}")
+
+    # Caption too long or photo failed — send photo then text
     try:
         await target.reply_photo(fid)
     except Exception as e:
         print(f"[BANNER ERROR] {type(e).__name__}: {e}")
+    await target.reply_text(text, **kw)
 
 
 async def cmd_setbanner(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -588,8 +614,6 @@ def build_msg(results, elapsed, requester):
 
 async def cmd_start(u: Update, _):
     name = u.effective_user.first_name
-    await send_banner(u.message)
-
     welcome = (
         "👁  <b>K A G E  X  B A N  C H E C K E R</b>  👁\n"
         "<i>— We see through every shadow —</i>\n\n"
@@ -607,7 +631,6 @@ async def cmd_start(u: Update, _):
         "  <code>!check 234xxx 447xxx 155xxx</code>\n\n"
         "💀 <b>K A G E  X</b>  ·  <i>The shadow never lies.</i>"
     )
-
     kb = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🔍 How To Check", callback_data="help"),
@@ -617,12 +640,11 @@ async def cmd_start(u: Update, _):
             InlineKeyboardButton("💀 About KAGE X", callback_data="about"),
         ],
     ])
-    await u.message.reply_text(welcome, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await send_with_banner(u.message, welcome, reply_markup=kb)
 
 
 async def cmd_help(u: Update, _):
-    t = u.message or u.callback_query.message
-    await send_banner(t)
+    t   = u.message or u.callback_query.message
     msg = (
         "⚡ <b>KAGE X — Commands</b>\n\n"
         "<code>!check +234xxxxxxxx</code> — single check\n"
@@ -632,12 +654,11 @@ async def cmd_help(u: Update, _):
         "<code>!about</code> — about KAGE X\n\n"
         f"⚡ Max <b>{MAX_NUM}</b> numbers per request."
     )
-    await t.reply_text(msg, parse_mode=ParseMode.HTML)
+    await send_with_banner(t, msg)
 
 
 async def cmd_about(u: Update, _):
-    t = u.message or u.callback_query.message
-    await send_banner(t)
+    t   = u.message or u.callback_query.message
     msg = (
         "<blockquote>"
         "👁  <b>K A G E  X  —  S H A D O W  E D I T I O N</b>  👁\n"
@@ -653,17 +674,17 @@ async def cmd_about(u: Update, _):
         "    <i>The shadow never lies.</i>"
         "</blockquote>"
     )
-    await t.reply_text(msg, parse_mode=ParseMode.HTML)
+    await send_with_banner(t, msg)
 
 
 async def cmd_testapi(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     target = u.message or u.callback_query.message
-    await send_banner(target)
     wait   = await target.reply_text("🔍 Testing KAGE X BanCheck API...",
                                      parse_mode=ParseMode.HTML)
     conn = aiohttp.TCPConnector(limit=5, ssl=False)
     async with aiohttp.ClientSession(connector=conn) as sess:
         result = await baron0_check(sess, "447386195088")
+    await wait.delete()
 
     if result is None:
         txt = (
@@ -684,16 +705,16 @@ async def cmd_testapi(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Result: <b>{result['status'].upper()}</b>\n"
             f"💀 KAGE X is fully online 🔥"
         )
-    await wait.edit_text(txt, parse_mode=ParseMode.HTML)
+    await send_with_banner(target, txt)
 
 
 async def cmd_ping(u: Update, _):
-    await send_banner(u.message)
     t0  = time.monotonic()
-    msg = await u.message.reply_text("🏓 Pinging...")
+    tmp = await u.message.reply_text("🏓 Pinging...")
     ms  = round((time.monotonic() - t0) * 1000)
-    await msg.edit_text(f"🏓 <b>Pong!</b>\n⚡ Latency: <code>{ms} ms</code>",
-                        parse_mode=ParseMode.HTML)
+    await tmp.delete()
+    await send_with_banner(u.message,
+                           f"🏓 <b>Pong!</b>\n⚡ Latency: <code>{ms} ms</code>")
 
 
 async def cmd_check(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -711,7 +732,6 @@ async def cmd_check(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await send_banner(u.message)
     wait = await u.message.reply_text(
         f"🌑 <b>Scanning</b> <code>{len(nums)}</code> number(s) through the shadow... ⚡",
         parse_mode=ParseMode.HTML,
@@ -726,9 +746,9 @@ async def cmd_check(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("🔄 CHECK ANOTHER", callback_data="check_another"),
         InlineKeyboardButton("📞 CONTACT",       url="https://t.me/"),
     ]])
-    await u.message.reply_text(
+    await send_with_banner(
+        u.message,
         build_msg(results, elapsed, req),
-        parse_mode=ParseMode.HTML,
         reply_markup=result_kb,
     )
 
