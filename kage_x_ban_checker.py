@@ -113,39 +113,39 @@ def parse_numbers(text: str) -> list:
     return out[:MAX_NUM]
 
 
-CAPTION_LIMIT = 950  # Telegram caption hard-limit is 1024; stay safe
+CAPTION_LIMIT = 950  # Telegram caption display limit; stay safe
 
 async def send_with_banner(target, text: str,
                            parse_mode=ParseMode.HTML,
                            reply_markup=None) -> None:
     """
-    Send image + text in ONE message bubble (photo+caption), exactly like Sanctum.
-    Falls back gracefully: if no banner just sends text; if text too long sends
-    photo first then text separately.
+    Sanctum-style: image + blockquote text in ONE bubble (photo + caption).
+    Telegram Bot API 7.0+ supports <blockquote> inside captions.
+    Falls back to photo-then-text if caption is too long, or text-only if no banner.
     """
     fid  = get_banner()
     kw   = {"parse_mode": parse_mode}
     if reply_markup:
         kw["reply_markup"] = reply_markup
 
-    # Normalize: strip any existing blockquote tags, re-apply consistently
-    clean = text.replace("<blockquote>", "").replace("</blockquote>", "").strip()
-    quoted = f"<blockquote>{clean}</blockquote>"  # for plain-text sends
+    # Normalise: strip existing blockquote then re-wrap
+    clean  = text.replace("<blockquote>", "").replace("</blockquote>", "").strip()
+    quoted = f"<blockquote>{clean}</blockquote>"
 
     if not fid:
-        # No banner — send as quoted text
+        # No banner — quoted text only
         await target.reply_text(quoted, **kw)
         return
 
-    # Caption path: <blockquote> not supported, use clean text
     if len(clean) <= CAPTION_LIMIT:
         try:
-            await target.reply_photo(photo=fid, caption=clean, **kw)
+            # ONE bubble: image on top + blockquote caption below  ← same as Sanctum
+            await target.reply_photo(photo=fid, caption=quoted, **kw)
             return
         except Exception as e:
             print(f"[BANNER+CAPTION ERROR] {type(e).__name__}: {e}")
 
-    # Caption too long or photo failed — photo then quoted text
+    # Caption too long or photo failed — send photo then quoted text separately
     try:
         await target.reply_photo(fid)
     except Exception as e:
