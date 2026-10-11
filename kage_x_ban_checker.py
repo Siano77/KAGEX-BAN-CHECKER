@@ -128,26 +128,29 @@ async def send_with_banner(target, text: str,
     if reply_markup:
         kw["reply_markup"] = reply_markup
 
+    # Normalize: strip any existing blockquote tags, re-apply consistently
+    clean = text.replace("<blockquote>", "").replace("</blockquote>", "").strip()
+    quoted = f"<blockquote>{clean}</blockquote>"  # for plain-text sends
+
     if not fid:
-        await target.reply_text(text, **kw)
+        # No banner — send as quoted text
+        await target.reply_text(quoted, **kw)
         return
 
-    # Strip <blockquote> tags — not supported in captions
-    caption = text.replace("<blockquote>", "").replace("</blockquote>", "")
-
-    if len(caption) <= CAPTION_LIMIT:
+    # Caption path: <blockquote> not supported, use clean text
+    if len(clean) <= CAPTION_LIMIT:
         try:
-            await target.reply_photo(photo=fid, caption=caption, **kw)
+            await target.reply_photo(photo=fid, caption=clean, **kw)
             return
         except Exception as e:
             print(f"[BANNER+CAPTION ERROR] {type(e).__name__}: {e}")
 
-    # Caption too long or photo failed — send photo then text
+    # Caption too long or photo failed — photo then quoted text
     try:
         await target.reply_photo(fid)
     except Exception as e:
         print(f"[BANNER ERROR] {type(e).__name__}: {e}")
-    await target.reply_text(text, **kw)
+    await target.reply_text(quoted, **kw)
 
 
 async def cmd_setbanner(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -610,7 +613,7 @@ def build_msg(results, elapsed, requester):
 
 # ════════════════════════════════════════════════
 #  HANDLERS
-# ════════════════════════════════════════════════
+# ══════════════════��═════════════════════════════
 
 async def cmd_start(u: Update, _):
     name = u.effective_user.first_name
@@ -744,7 +747,7 @@ async def cmd_check(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     result_kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 CHECK ANOTHER", callback_data="check_another"),
-        InlineKeyboardButton("📞 CONTACT",       url="https://t.me/heiskagex"),
+        InlineKeyboardButton("📞 CONTACT",       url="https://t.me/"),
     ]])
     await send_with_banner(
         u.message,
