@@ -744,7 +744,7 @@ async def cmd_check(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     result_kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 CHECK ANOTHER", callback_data="check_another"),
-        InlineKeyboardButton("📞 CONTACT",       url="https://t.me/"),
+        InlineKeyboardButton("📞 CONTACT",       url="https://t.me/heiskagex"),
     ]])
     await send_with_banner(
         u.message,
