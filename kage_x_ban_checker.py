@@ -8,6 +8,8 @@ Prefix: !  |  Simultaneous  |  Personal / Regional / Admin
 
 import os, asyncio, aiohttp, re, time, random, string, json
 from datetime import datetime
+from html import escape
+from html.parser import HTMLParser
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -25,41 +27,38 @@ PREFIX    = "!"
 MAX_NUM   = 20
 
 # BanCheck API — baron0.com
-BANCHECK_KEY = os.getenv(
-    "BANCHECK_KEY",
-    "bk_v1_jLzHajfQ2_vMitdCmKPZh1b9Mg1iQmj3WTKs3fwEFwScIMnGaP1VtH3tnGEp"
-    "d4znob40m0AYcHZV-TZZ2_RbHg2XQxNPaKXRSxYIZwpZagaF6DclHfbSNgY0ZPzl61"
-    "r5XwvURqN9H0k0AWKP4miv9cnV4NTkVcagrcUGssscMEyo95BNWSDL-ima_7Y2kvN32f"
-    "-_vVkIcwkv4hjzV3X79sgZoKYh7Y_cpsfTCMp9r1yEwdcQYyuimjwORVjTNdFOjRSxr"
-    "U3oMMkYfl5ICt06bvi8wwGk3VHJGN7UntgqRAT_0AIUgKD4OhbP6IcU-EJyBraQPXPG"
-    "oJtc2qt8XlbaCkZhUqc7NhdoqH0EY6F9stC3z0kOoztmoweatG5EdF6yJ-zGLKmqRF0"
-    "ML2xS6Nkvs9_JZdAqLkCpAFICfPuyZ9b2hv0h8jmfIo0r2zTVbndu0gyHsFoXQ_zCh0"
-    "AWZwe6LaRXsCz8rsmA_VpilvBegFx9iUsRrGrfcXFKPZ364qEpiU0R3p-a1-9zyGYdiv"
-    "G6PkZN8gLZakTSt_wMNupOBg9n47FWeQ9SqYxrCz5KXO3TLlRZeSYP"
-)
+BANCHECK_KEY = os.getenv("BANCHECK_KEY", "")
 BARON_URL   = "https://baron0.com/api/v2/check"  # confirmed endpoint
 OWNER_ID    = int(os.getenv("OWNER_ID", "0"))   # set to YOUR Telegram user ID in Railway
-BOT_BANNER   = os.getenv("BOT_BANNER", "")  # optional env-var fallback
-BANNER_FILE  = "banner.txt"                 # persists banner file_id across restarts
+BOT_BANNER = os.getenv("BOT_BANNER", "")
+CHECK_BANNER = os.getenv("CHECK_BANNER", "")
+BANNER_FILE = "banner.txt"
+CHECK_BANNER_FILE = "check_banner.txt"
 
-# ── Runtime banner state (updated by !setbanner without restart) ──────────────
-def _load_banner() -> str:
+
+def _load_banner(path: str, fallback: str) -> str:
     try:
-        txt = open(BANNER_FILE).read().strip()
-        if txt: return txt
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip() or fallback
     except FileNotFoundError:
-        pass
-    return BOT_BANNER
+        return fallback
 
-_banner: list = [_load_banner()]   # list so inner functions can mutate it
 
-def get_banner() -> str:  return _banner[0]
-def set_banner(fid: str) -> None:
-    _banner[0] = fid
-    try:
-        open(BANNER_FILE, "w").write(fid)
-    except Exception as e:
-        print(f"[BANNER SAVE ERROR] {e}")
+_banner = [_load_banner(BANNER_FILE, BOT_BANNER)]
+_check_banner = [_load_banner(CHECK_BANNER_FILE, CHECK_BANNER)]
+
+
+def get_banner(check: bool = False) -> str:
+    # Once configured, the check image is independent of the general image.
+    return (_check_banner[0] or _banner[0]) if check else _banner[0]
+
+
+def set_banner(fid: str, check: bool = False) -> None:
+    path = CHECK_BANNER_FILE if check else BANNER_FILE
+    # Persist before changing runtime state; never falsely report a saved image.
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(fid)
+    (_check_banner if check else _banner)[0] = fid
 
 
 # ════════════════════════════════════════════════
@@ -113,78 +112,138 @@ def parse_numbers(text: str) -> list:
     return out[:MAX_NUM]
 
 
-CAPTION_LIMIT = 950  # Telegram caption display limit; stay safe
+CAPTION_LIMIT = 1024
+MESSAGE_LIMIT = 4096
+
+
+class _ReplyText(HTMLParser):
+    """Read our existing HTML templates as plain text, preserving whitespace."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "br":
+            self.parts.append("\n")
+
+
+def plain_reply(text: str) -> str:
+    parser = _ReplyText()
+    parser.feed(text)
+    parser.close()
+    return "".join(parser.parts).strip()
+
+
+def monospace(text: str) -> str:
+    # A real Telegram code block, not Unicode lookalike letters.
+    return f"<pre>{escape(plain_reply(text), quote=False)}</pre>"
+
+
+def telegram_length(text: str) -> int:
+    # Telegram measures entity offsets in UTF-16 code units; use this
+    # conservative budget so emoji-heavy replies also fit safely.
+    return len(text.encode("utf-16-le")) // 2
+
+
+def split_reply(text: str, limit: int = MESSAGE_LIMIT) -> list[str]:
+    chunks = []
+    while telegram_length(text) > limit:
+        units = 0
+        cut = 0
+        for char in text:
+            width = telegram_length(char)
+            if units + width > limit:
+                break
+            units += width
+            cut += 1
+        newline = text.rfind("\n", 0, cut + 1)
+        if newline > 0:
+            cut = newline + 1
+        chunks.append(text[:cut])
+        text = text[cut:]
+    if text:
+        chunks.append(text)
+    return chunks or [" "]
+
+
+async def reply_monospace(target, text: str, **kwargs):
+    kwargs["parse_mode"] = ParseMode.HTML
+    markup = kwargs.pop("reply_markup", None)
+    chunks = split_reply(plain_reply(text))
+    last = None
+    for index, chunk in enumerate(chunks):
+        options = dict(kwargs)
+        if markup is not None and index == len(chunks) - 1:
+            options["reply_markup"] = markup
+        last = await target.reply_text(
+            f"<pre>{escape(chunk, quote=False)}</pre>", **options
+        )
+    return last
+
 
 async def send_with_banner(target, text: str,
                            parse_mode=ParseMode.HTML,
-                           reply_markup=None) -> None:
-    """
-    Sanctum-style: image + blockquote text in ONE bubble (photo + caption).
-    Telegram Bot API 7.0+ supports <blockquote> inside captions.
-    Falls back to photo-then-text if caption is too long, or text-only if no banner.
-    """
-    fid  = get_banner()
-    kw   = {"parse_mode": parse_mode}
-    if reply_markup:
-        kw["reply_markup"] = reply_markup
-
-    # Normalise: strip existing blockquote then re-wrap
-    clean  = text.replace("<blockquote>", "").replace("</blockquote>", "").strip()
-    quoted = f"<blockquote>{clean}</blockquote>"
-
-    if not fid:
-        # No banner — quoted text only
-        await target.reply_text(quoted, **kw)
-        return
-
-    if len(clean) <= CAPTION_LIMIT:
+                           reply_markup=None, *, check: bool = False) -> None:
+    """Use a dedicated image for checks and monospace text for every reply."""
+    fid = get_banner(check=check)
+    clean = plain_reply(text)
+    if fid:
+        if telegram_length(clean) <= CAPTION_LIMIT:
+            try:
+                await target.reply_photo(
+                    photo=fid,
+                    caption=f"<pre>{escape(clean, quote=False)}</pre>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup,
+                )
+                return
+            except Exception as exc:
+                print(f"[BANNER+CAPTION ERROR] {type(exc).__name__}: {exc}")
+        # Long batch reports cannot fit in a photo caption. Keep their image
+        # and send separate, safely sized code blocks instead.
         try:
-            # ONE bubble: image on top + blockquote caption below  ← same as Sanctum
-            await target.reply_photo(photo=fid, caption=quoted, **kw)
-            return
-        except Exception as e:
-            print(f"[BANNER+CAPTION ERROR] {type(e).__name__}: {e}")
+            await target.reply_photo(photo=fid)
+        except Exception as exc:
+            print(f"[BANNER ERROR] {type(exc).__name__}: {exc}")
+    await reply_monospace(target, text, reply_markup=reply_markup)
 
-    # Caption too long or photo failed — send photo then quoted text separately
+
+async def _set_banner_command(u: Update, *, check: bool = False) -> None:
+    msg = u.effective_message
+    # Fail closed if OWNER_ID has not been configured.
+    if not OWNER_ID or not u.effective_user or u.effective_user.id != OWNER_ID:
+        await reply_monospace(msg, "🚫 Owner only. Set OWNER_ID to enable banner changes.")
+        return
+    command = "!setcheckbanner" if check else "!setbanner"
+    label = "check-result" if check else "general"
+    if not msg.photo:
+        await reply_monospace(
+            msg,
+            f"📸 Set your {label} image\n\n"
+            f"1. Attach a photo (not a document).\n"
+            f"2. Add this caption: {command}\n"
+            "3. Send it to this bot.\n\n"
+            "The other banner will not change.",
+        )
+        return
     try:
-        await target.reply_photo(fid)
-    except Exception as e:
-        print(f"[BANNER ERROR] {type(e).__name__}: {e}")
-    await target.reply_text(quoted, **kw)
+        set_banner(msg.photo[-1].file_id, check=check)
+    except OSError as exc:
+        print(f"[BANNER SAVE ERROR] {type(exc).__name__}: {exc}")
+        await reply_monospace(msg, "❌ Could not save banner. Check storage permissions and retry.")
+        return
+    await reply_monospace(msg, f"✅ {label.capitalize()} image saved. The other banner is unchanged.")
 
 
 async def cmd_setbanner(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """!setbanner — owner-only: send as photo caption to set the banner image."""
-    msg = u.message or u.effective_message
-    # Block non-owners
-    if OWNER_ID and u.effective_user.id != OWNER_ID:
-        await msg.reply_text(
-            "🚫 <b>Owner only.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    # Called with no photo (text-only !setbanner) → show instructions
-    if not u.message or not u.message.photo:
-        await (msg or u.effective_message).reply_text(
-            "📸 <b>How to set your KAGE X banner:</b>\n\n"
-            "1️⃣  Tap the 📎 attachment icon\n"
-            "2️⃣  Pick your image\n"
-            "3️⃣  <b>Type as caption:</b> <code>!setbanner</code>\n"
-            "4️⃣  Send it to this bot\n\n"
-            "✅ Done — banner will show on every command instantly.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    # Photo received — grab highest-quality variant
-    fid = msg.photo[-1].file_id
-    set_banner(fid)
-    print(f"[BANNER SET] file_id={fid}")
-    await msg.reply_text(
-        "✅ <b>Banner saved!</b>\n\n"
-        "Your image will now appear before every command.\n"
-        f"<i>file_id: <code>{fid[:40]}...</code></i>",
-        parse_mode=ParseMode.HTML,
-    )
+    await _set_banner_command(u)
+
+
+async def cmd_setcheckbanner(u: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_banner_command(u, check=True)
 
 
 def mask_number(display: str) -> str:
@@ -588,11 +647,11 @@ def build_msg(results, elapsed, requester):
     ]
 
     for i, r in enumerate(results, 1):
-        icon, lbl = STATUS_DISPLAY.get(r["status"], ("🌀", r["status"].upper()))
-        masked    = mask_number(r["display"])
+        icon, lbl = STATUS_DISPLAY.get(r["status"], ("🌀", escape(r["status"].upper())))
+        masked    = escape(mask_number(r["display"]))
         bt        = BAN_DISPLAY.get(r.get("ban_type"), "") if r.get("ban_type") else "—"
-        src       = r.get("source", "KAGE X API")
-        note      = r.get("note", "")
+        src       = escape(str(r.get("source", "KAGE X API")))
+        note      = escape(str(r.get("note", "")))
 
         lines.append(f"<b>[ #{i} ]</b>")
         lines.append(f"📱 <b>Number</b>   : <code>{masked}</code>")
@@ -606,7 +665,7 @@ def build_msg(results, elapsed, requester):
 
     lines += [
         div,
-        f"  👤 <b>{requester}</b>  ·  💀 <b>K A G E  X</b> 💀",
+        f"  👤 <b>{escape(requester)}</b>  ·  💀 <b>K A G E  X</b> 💀",
     ]
     return "\n".join(lines)
 
@@ -616,7 +675,7 @@ def build_msg(results, elapsed, requester):
 # ══════════════════��═════════════════════════════
 
 async def cmd_start(u: Update, _):
-    name = u.effective_user.first_name
+    name = escape(u.effective_user.first_name)
     welcome = (
         "👁  <b>K A G E  X  B A N  C H E C K E R</b>  👁\n"
         "<i>— We see through every shadow —</i>\n\n"
@@ -682,7 +741,7 @@ async def cmd_about(u: Update, _):
 
 async def cmd_testapi(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     target = u.message or u.callback_query.message
-    wait   = await target.reply_text("🔍 Testing KAGE X BanCheck API...",
+    wait   = await reply_monospace(target, "🔍 Testing KAGE X BanCheck API...",
                                      parse_mode=ParseMode.HTML)
     conn = aiohttp.TCPConnector(limit=5, ssl=False)
     async with aiohttp.ClientSession(connector=conn) as sess:
@@ -713,7 +772,7 @@ async def cmd_testapi(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_ping(u: Update, _):
     t0  = time.monotonic()
-    tmp = await u.message.reply_text("🏓 Pinging...")
+    tmp = await reply_monospace(u.message, "🏓 Pinging...")
     ms  = round((time.monotonic() - t0) * 1000)
     await tmp.delete()
     await send_with_banner(u.message,
@@ -726,7 +785,7 @@ async def cmd_check(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user  = u.effective_user
 
     if not nums:
-        await u.message.reply_text(
+        await reply_monospace(u.message, 
             "⚠️ <b>No numbers found.</b>\n\n"
             "Include country code:\n"
             "  <code>!check +2348012345678</code>\n"
@@ -735,7 +794,7 @@ async def cmd_check(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    wait = await u.message.reply_text(
+    wait = await reply_monospace(u.message, 
         f"🌑 <b>Scanning</b> <code>{len(nums)}</code> number(s) through the shadow... ⚡",
         parse_mode=ParseMode.HTML,
     )
@@ -753,6 +812,7 @@ async def cmd_check(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         u.message,
         build_msg(results, elapsed, req),
         reply_markup=result_kb,
+        check=True,
     )
 
 
@@ -764,12 +824,13 @@ async def on_prefix(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.args = parts[1].split() if len(parts) > 1 else []
     fn = {"check": cmd_check, "start": cmd_start, "help": cmd_help,
           "about": cmd_about, "ping": cmd_ping, "testapi": cmd_testapi,
-          "setbanner": cmd_setbanner}.get(cmd)
+          "setbanner": cmd_setbanner,
+          "setcheckbanner": cmd_setcheckbanner}.get(cmd)
     if fn:
         await fn(u, ctx)
     else:
-        await u.message.reply_text(
-            f"❓ Unknown: <code>!{cmd}</code> — try <code>!help</code>",
+        await reply_monospace(u.message, 
+            f"❓ Unknown: <code>!{escape(cmd)}</code> — try <code>!help</code>",
             parse_mode=ParseMode.HTML,
         )
 
@@ -777,7 +838,7 @@ async def on_prefix(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_cb(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
     if q.data == "check_another":
-        await q.message.reply_text(
+        await reply_monospace(q.message, 
             "⚡ <b>Send your next number(s):</b>\n\n"
             "  <code>!check +2348012345678</code>\n"
             "  <code>!check 234xxx 447xxx 155xxx</code>",
@@ -802,13 +863,18 @@ def main():
 
     app = Application.builder().token(token).build()
     for c, f in [("start", cmd_start), ("help", cmd_help), ("about", cmd_about),
-                 ("ping", cmd_ping), ("check", cmd_check), ("testapi", cmd_testapi)]:
+                 ("ping", cmd_ping), ("check", cmd_check), ("testapi", cmd_testapi),
+                 ("setbanner", cmd_setbanner), ("setcheckbanner", cmd_setcheckbanner)]:
         app.add_handler(CommandHandler(c, f))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_prefix))
-    # Photo with !setbanner caption → set the banner image
+    # Separate exact-match photo-caption commands for each banner
     app.add_handler(MessageHandler(
-        filters.PHOTO & filters.CaptionRegex(r"(?i)^!setbanner"),
+        filters.PHOTO & filters.CaptionRegex(r"(?i)^[!/]setbanner(?:@\w+)?\s*$"),
         cmd_setbanner,
+    ))
+    app.add_handler(MessageHandler(
+        filters.PHOTO & filters.CaptionRegex(r"(?i)^[!/]setcheckbanner(?:@\w+)?\s*$"),
+        cmd_setcheckbanner,
     ))
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_error_handler(on_err)
