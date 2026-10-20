@@ -88,3 +88,12 @@ message splitting, separate image routing, banner persistence, owner restriction
 and photo-send fallback. Live Telegram rendering and the external checking API
 have not been tested. The underlying checking engine is unchanged; this update
 is not a verification of the accuracy of its ban-status results.
+
+## New: owner/admin panel
+
+Open `!admin` or `/admin` in a private chat. Includes stats, uptime, users, groups,
+bans, owner-only admin management, and confirmed broadcasts.
+
+See **ADMIN_PANEL.md** for setup, commands, persistent SQLite storage and limitations.
+The main Python file only adds an import and registration call; its original
+checking logic, API configuration, banners and formatters are unchanged.

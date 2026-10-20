@@ -16,6 +16,7 @@ from telegram.ext import (
     CallbackQueryHandler, filters, ContextTypes,
 )
 from telegram.constants import ParseMode
+from admin_panel import register_admin_panel
 
 # ════════════════════════════════════════════════
 #  CONFIG  —  set BOT_TOKEN and optionally BANCHECK_KEY as Railway env vars
@@ -862,6 +863,7 @@ def main():
         print("⚠️  BOT_TOKEN not set."); return
 
     app = Application.builder().token(token).build()
+    register_admin_panel(app, OWNER_ID, reply_monospace)
     for c, f in [("start", cmd_start), ("help", cmd_help), ("about", cmd_about),
                  ("ping", cmd_ping), ("check", cmd_check), ("testapi", cmd_testapi),
                  ("setbanner", cmd_setbanner), ("setcheckbanner", cmd_setcheckbanner)]:
