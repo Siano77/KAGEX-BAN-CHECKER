@@ -28,6 +28,22 @@ COMMANDS = {
 }
 
 
+# Separate from the general/check banners. Only the owner can change these.
+PHOTO_COMMANDS = {
+    "setadminpic": "panel", "setstatspic": "stats", "setuptimepic": "uptime",
+    "setuserspic": "users", "setgroupspic": "groups", "setadminspic": "admins",
+    "setbanpic": "ban", "setunbanpic": "unban", "setaddadminpic": "add",
+    "setremoveadminpic": "remove", "setbroadcastpic": "broadcast",
+}
+PHOTO_LABELS = {
+    "panel": "Admin Panel", "stats": "Bot Stats", "uptime": "Uptime",
+    "users": "Users List", "groups": "Groups", "admins": "Admins List",
+    "ban": "Ban User", "unban": "Unban User", "add": "Add Admin",
+    "remove": "Remove Admin", "broadcast": "Broadcast",
+}
+COMMANDS.update({name: "setpic:" + category for name, category in PHOTO_COMMANDS.items()})
+
+
 class Store:
     """Short, parameterized local transactions; no open transaction spans an await."""
     def __init__(self, path):
@@ -47,6 +63,9 @@ class Store:
                 CREATE TABLE IF NOT EXISTS bans (
                     user_id INTEGER PRIMARY KEY, banned_by INTEGER NOT NULL,
                     banned_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS admin_photos (
+                    category TEXT PRIMARY KEY, photo_id TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS groups_seen (
                     chat_id INTEGER PRIMARY KEY, title TEXT NOT NULL,
@@ -95,6 +114,18 @@ class Store:
 
     def admin(self, uid):
         return bool(self.scalar("SELECT COUNT(*) FROM admins WHERE user_id=?", (uid,)))
+
+    def get_photo(self, category):
+        rows = self.rows("SELECT photo_id FROM admin_photos WHERE category=?", (category,))
+        return rows[0]["photo_id"] if rows else None
+
+    def set_photo(self, category, photo_id):
+        if photo_id is None:
+            self.execute("DELETE FROM admin_photos WHERE category=?", (category,))
+        else:
+            self.execute("""INSERT INTO admin_photos(category,photo_id) VALUES(?,?)
+                ON CONFLICT(category) DO UPDATE SET photo_id=excluded.photo_id""",
+                (category,photo_id))
 
     def recipients(self):
         return self.rows("""
@@ -150,9 +181,57 @@ class AdminPanel:
         # No hidden access when owner configuration is absent.
         return bool(self.owner_id and (uid == self.owner_id or self.store.admin(uid)))
 
-    async def say(self, msg, text, markup=BACK):
+    async def say(self, msg, text, markup=BACK, *, category=None):
+        photo_id = None
+        if category:
+            photo_id = self.store.get_photo(category)
+            if photo_id is None and category != "panel":
+                photo_id = self.store.get_photo("panel")
+        if photo_id:
+            # Preserve the same monospace look, including on photo captions.
+            # Telegram captions are short; long lists keep their existing splitter.
+            short = len(text.encode("utf-16-le")) // 2 <= 1024
+            try:
+                if short:
+                    return await msg.reply_photo(
+                        photo=photo_id, caption=f"<pre>{escape(text, quote=False)}</pre>",
+                        parse_mode="HTML", reply_markup=markup)
+                await msg.reply_photo(photo=photo_id)
+            except TelegramError as exc:
+                # A deleted/invalid image must never hide buttons or admin output.
+                log.warning("Admin category photo failed (%s): %s", category, type(exc).__name__)
         # The shared formatter reads HTML; escape untrusted names/group titles first.
         return await self.reply(msg, escape(text), reply_markup=markup)
+
+    async def set_picture(self, msg, uid, category, args):
+        if not self.owner_id or uid != self.owner_id:
+            await self.say(msg, "🚫 Only the owner can change admin-category pictures.")
+            return
+        if category not in PHOTO_LABELS:
+            await self.say(msg, "Unknown admin picture category.")
+            return
+        if msg.chat.type != "private":
+            await self.say(msg, "🔒 Send picture commands in a private chat with this bot.", None)
+            return
+        command = next(name for name, value in PHOTO_COMMANDS.items() if value == category)
+        photos = getattr(msg, "photo", None)
+        if args.lower() == "clear" and not photos:
+            self.store.set_photo(category, None)
+            fallback = "This category will use the main Admin Panel picture, if set." if category != "panel" else "Categories with their own pictures are unchanged."
+            await self.say(msg, f"✅ {PHOTO_LABELS[category]} picture cleared.\n{fallback}")
+            return
+        if args or not photos:
+            await self.say(msg, f"📸 SET {PHOTO_LABELS[category].upper()} PICTURE\n\n"
+                           "Attach a photo (not a document).\n"
+                           f"Set its caption to: !{command}\n"
+                           "Send it here to save it.\n\n"
+                           f"To remove this setting, send: !{command} clear\n"
+                           "Your general and check banners are not changed.")
+            return
+        self.store.set_photo(category, photos[-1].file_id)
+        await self.say(msg, f"✅ {PHOTO_LABELS[category]} picture saved.\n"
+                       "Other category pictures and general/check banners are unchanged.",
+                       category=category)
 
     def parse_command(self, text, bot_username):
         match = re.match(r"^[!/]([a-z]+)(?:@([a-z0-9_]+))?(?:\s+([\s\S]*))?$", text.strip(), re.I)
@@ -271,12 +350,14 @@ class AdminPanel:
             rows.append([("➕ Add Admin", "add"), ("➖ Remove Admin", "remove")])
         rows.append([("📢 Broadcast", "broadcast")])
         await self.say(msg, "👑 KAGE X — ADMIN PANEL\n\nChoose a category below.\n"
-                       "Changes and broadcasts require confirmation.", keyboard(rows))
+                       "Changes and broadcasts require confirmation.", keyboard(rows), category="panel")
 
     async def command(self, msg, uid, cmd, args, ctx):
         # A new panel command invalidates older confirmation buttons.
         self.pending.pop((uid, msg.chat.id), None)
-        if cmd == "cancel":
+        if cmd.startswith("setpic:"):
+            await self.set_picture(msg, uid, cmd.split(":", 1)[1], args)
+        elif cmd == "cancel":
             self.pending.pop((uid, msg.chat.id), None)
             await self.say(msg, "✖ Pending action cancelled.")
         elif cmd == "panel":
@@ -324,19 +405,19 @@ class AdminPanel:
             }
             await self.say(msg, "📊 BOT STATS\n\n" + "\n".join(f"{k}: {v}" for k,v in values.items()) +
                            "\n\nCounts begin when this module is installed.\n"
-                           "These are local counts, not Telegram's monthly-user badge.")
+                           "These are local counts, not Telegram's monthly-user badge.", category="stats")
         elif action == "uptime":
             seconds = int(time.monotonic()-self.started)
             days, remainder = divmod(seconds, 86400)
             hours, remainder = divmod(remainder, 3600)
             minutes, seconds = divmod(remainder, 60)
-            await self.say(msg, f"⏱ UPTIME\n\n{days}d {hours}h {minutes}m {seconds}s\n\nSince this bot process started.")
+            await self.say(msg, f"⏱ UPTIME\n\n{days}d {hours}h {minutes}m {seconds}s\n\nSince this bot process started.", category="uptime")
         elif action == "admins":
             rows = self.store.rows("SELECT a.user_id,u.name,u.username FROM admins a LEFT JOIN users u USING(user_id) WHERE a.user_id!=? ORDER BY a.added_at", (self.owner_id,))
             lines = ["👑 ADMINS", f"Owner: {self.owner_id}"]
             for row in rows:
                 lines.append(f"{row['user_id']} · {(row['name'] or 'Not yet seen')[:70]}")
-            await self.say(msg, "\n".join(lines))
+            await self.say(msg, "\n".join(lines), category="admins")
         elif action in ("users", "groups"):
             await self.show_page(msg, action, page)
 
@@ -371,7 +452,7 @@ class AdminPanel:
             nav.append(("Next ➡", f"{action}:{page+1}"))
         rows = [nav] if nav else []
         rows.append([("⬅ Admin Panel", "panel")])
-        await self.say(msg, "\n".join(lines), keyboard(rows))
+        await self.say(msg, "\n".join(lines), keyboard(rows), category=action)
 
     def target_error(self, actor, action, target):
         if action in ("add", "remove") and actor != self.owner_id:
@@ -391,7 +472,7 @@ class AdminPanel:
         labels = {"ban":"BAN USER", "unban":"UNBAN USER", "add":"ADD ADMIN", "remove":"REMOVE ADMIN"}
         self.put_state(msg, uid, kind="input", action=action)
         await self.say(msg, f"{labels[action]}\n\nSend the person's numeric Telegram user ID.\n"
-                       "Use Users List to find an ID.\n\n!cancel stops this action. Prompt expires in 10 minutes.", CANCEL)
+                       "Use Users List to find an ID.\n\n!cancel stops this action. Prompt expires in 10 minutes.", CANCEL, category=action)
 
     async def prepare_target(self, msg, uid, action, text):
         if not re.fullmatch(r"[1-9][0-9]{0,18}", text) or int(text) > 2**63-1:
@@ -410,21 +491,21 @@ class AdminPanel:
         if action == "add":
             note = "\nThis grants access to user/group lists, bans and broadcasts."
         await self.say(msg, f"Confirm: {label}\nUser ID: {target}{note}",
-                       keyboard([[("✅ Confirm", "confirm:"+nonce), ("✖ Cancel", "cancel")]]))
+                       keyboard([[("✅ Confirm", "confirm:"+nonce), ("✖ Cancel", "cancel")]]), category=action)
 
     def broadcasting(self):
         return self.broadcast_task is not None and not self.broadcast_task.done()
 
     async def prompt_broadcast(self, msg, uid):
         if self.broadcasting():
-            await self.say(msg, "📢 A broadcast is already running.", keyboard([[("🛑 Stop broadcast", "stop")],[("⬅ Admin Panel", "panel")]]))
+            await self.say(msg, "📢 A broadcast is already running.", keyboard([[("🛑 Stop broadcast", "stop")],[("⬅ Admin Panel", "panel")]]), category="broadcast")
             return
         self.put_state(msg, uid, kind="input", action="broadcast")
         await self.say(msg, "📢 BROADCAST\n\nSend the message or media to broadcast.\n"
                        "You will see a preview before anything is sent.\n\n"
                        "Recipients: tracked private-chat users who are not banned\n"
                        "or known to have blocked the bot. Groups are not included.\n"
-                       "!cancel stops this action.", CANCEL)
+                       "!cancel stops this action.", CANCEL, category="broadcast")
 
     async def prepare_broadcast(self, msg, uid, ctx, text=None):
         if self.broadcasting():
@@ -443,10 +524,11 @@ class AdminPanel:
             return
         nonce = secrets.token_hex(8)
         self.put_state(msg, uid, kind="confirm", action="broadcast", draft=draft, nonce=nonce)
-        await self.say(msg, f"📢 Preview above.\n\nCurrent eligible recipients: {audience}\n"
+        await self.say(msg, f"📢 Broadcast preview sent separately above.\n"
+                       f"Category pictures are not included in the broadcast.\n\nCurrent eligible recipients: {audience}\n"
                        "Nothing has been broadcast yet. Send it?\n"
                        "Confirmation expires in 10 minutes.",
-                       keyboard([[("📢 Send broadcast", "confirm:"+nonce), ("✖ Cancel", "cancel")]]))
+                       keyboard([[("📢 Send broadcast", "confirm:"+nonce), ("✖ Cancel", "cancel")]]), category="broadcast")
 
     async def deliver(self, bot, chat_id, draft):
         if "text" in draft:
@@ -478,7 +560,7 @@ class AdminPanel:
                 self.run_broadcast(ctx.bot, msg, uid, state["draft"], targets), name="admin-broadcast")
             await self.say(msg, f"📢 Broadcast started. Recipients: {len(targets)}\n"
                            "You will receive a delivery summary.",
-                           keyboard([[("🛑 Stop broadcast", "stop")],[("⬅ Admin Panel", "panel")]]))
+                           keyboard([[("🛑 Stop broadcast", "stop")],[("⬅ Admin Panel", "panel")]]), category="broadcast")
             return
         target = state["target"]
         error = self.target_error(uid, action, target)
@@ -497,7 +579,7 @@ class AdminPanel:
                 if key[0] == target:
                     self.pending.pop(key, None)
         labels = {"ban":"Banned", "unban":"Unbanned", "add":"Admin access granted to", "remove":"Admin access removed from"}
-        await self.say(msg, f"✅ {labels[action]} user {target}.")
+        await self.say(msg, f"✅ {labels[action]} user {target}.", category=action)
 
     async def cancel_broadcast(self, msg, uid):
         if not self.broadcasting():
@@ -563,7 +645,7 @@ class AdminPanel:
             if self.is_admin(uid):
                 try:
                     await self.say(msg, f"📢 BROADCAST {label}\n\nDelivered: {sent}\nFailed: {failed}\n"
-                                   f"Skipped (banned): {skipped}\nNot attempted: {remaining}")
+                                   f"Skipped (banned): {skipped}\nNot attempted: {remaining}", category="broadcast")
                 except TelegramError:
                     log.warning("Could not send broadcast summary to admin")
 
