@@ -25,6 +25,8 @@ COMMANDS = {
     "users": "users", "groups": "groups", "admins": "admins", "ban": "ban",
     "unban": "unban", "addadmin": "add", "removeadmin": "remove",
     "broadcast": "broadcast", "cancel": "cancel", "cancelbroadcast": "stop",
+    "forcejoin": "forcejoin", "addforcejoin": "forcejoin_add",
+    "removeforcejoin": "forcejoin_remove",
 }
 
 
@@ -34,12 +36,14 @@ PHOTO_COMMANDS = {
     "setuserspic": "users", "setgroupspic": "groups", "setadminspic": "admins",
     "setbanpic": "ban", "setunbanpic": "unban", "setaddadminpic": "add",
     "setremoveadminpic": "remove", "setbroadcastpic": "broadcast",
+    "setforcejoinpic": "forcejoin",
 }
 PHOTO_LABELS = {
     "panel": "Admin Panel", "stats": "Bot Stats", "uptime": "Uptime",
     "users": "Users List", "groups": "Groups", "admins": "Admins List",
     "ban": "Ban User", "unban": "Unban User", "add": "Add Admin",
     "remove": "Remove Admin", "broadcast": "Broadcast",
+    "forcejoin": "Force Join",
 }
 COMMANDS.update({name: "setpic:" + category for name, category in PHOTO_COMMANDS.items()})
 
@@ -70,6 +74,11 @@ class Store:
                 CREATE TABLE IF NOT EXISTS groups_seen (
                     chat_id INTEGER PRIMARY KEY, title TEXT NOT NULL,
                     username TEXT, active INTEGER NOT NULL, last_seen REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS force_join_chats (
+                    chat_id INTEGER PRIMARY KEY, title TEXT NOT NULL,
+                    username TEXT, invite_link TEXT NOT NULL, chat_type TEXT NOT NULL,
+                    added_by INTEGER NOT NULL, added_at REAL NOT NULL
                 );
             """)
 
@@ -134,6 +143,9 @@ class Store:
                 AND user_id NOT IN (SELECT user_id FROM bans)
             ORDER BY user_id
         """)
+
+    def force_join_chats(self):
+        return self.rows("SELECT * FROM force_join_chats ORDER BY added_at, chat_id")
 
 
 class _Connection:
@@ -291,6 +303,19 @@ class AdminPanel:
                 await self.say(msg, "🚫 You are banned from using this bot.", None)
             raise ApplicationHandlerStop
 
+        force_callback = bool(query and (query.data or "") == "fj:check")
+        if not self.is_admin(user.id) and (interacting or force_callback):
+            missing = await self.missing_force_joins(ctx.bot, user.id)
+            if missing:
+                if query:
+                    await query.answer("Join every required chat first.", show_alert=True)
+                await self.force_join_notice(msg, missing)
+                raise ApplicationHandlerStop
+            if force_callback:
+                await query.answer("Membership verified.")
+                await self.say(msg, "✅ Membership verified.\n\nYou can now use the bot.", None)
+                raise ApplicationHandlerStop
+
         admin_callback = bool(query and (query.data or "").startswith("adm:"))
         state_key = (user.id, chat.id)
         state = self.pending.get(state_key)
@@ -329,6 +354,10 @@ class AdminPanel:
             if state["kind"] == "input":
                 if state["action"] == "broadcast":
                     await self.prepare_broadcast(msg, user.id, ctx)
+                elif state["action"] == "forcejoin_add":
+                    await self.add_force_join(msg, user.id, text, ctx)
+                elif state["action"] == "forcejoin_remove":
+                    await self.remove_force_join(msg, user.id, text)
                 else:
                     await self.prepare_target(msg, user.id, state["action"], text)
                 raise ApplicationHandlerStop
@@ -348,6 +377,7 @@ class AdminPanel:
         ]
         if uid == self.owner_id:
             rows.append([("➕ Add Admin", "add"), ("➖ Remove Admin", "remove")])
+            rows.append([("🔐 Force Join", "forcejoin")])
         rows.append([("📢 Broadcast", "broadcast")])
         await self.say(msg, "👑 KAGE X — ADMIN PANEL\n\nChoose a category below.\n"
                        "Changes and broadcasts require confirmation.", keyboard(rows), category="panel")
@@ -372,6 +402,18 @@ class AdminPanel:
                 await self.prepare_broadcast(msg, uid, ctx, text=args)
             else:
                 await self.prompt_broadcast(msg, uid)
+        elif cmd == "forcejoin":
+            await self.show_force_join(msg, uid)
+        elif cmd == "forcejoin_add":
+            if args:
+                await self.add_force_join(msg, uid, args, ctx)
+            else:
+                await self.prompt_force_join(msg, uid, "forcejoin_add")
+        elif cmd == "forcejoin_remove":
+            if args:
+                await self.remove_force_join(msg, uid, args)
+            else:
+                await self.prompt_force_join(msg, uid, "forcejoin_remove")
         elif cmd == "stop":
             await self.cancel_broadcast(msg, uid)
         else:
@@ -391,6 +433,135 @@ class AdminPanel:
         else:
             await self.say(msg, "This button is no longer valid. Open !admin again.")
 
+    async def missing_force_joins(self, bot, user_id):
+        missing = []
+        for row in self.store.force_join_chats():
+            try:
+                member = await bot.get_chat_member(row["chat_id"], user_id)
+                joined = member.status in ("member", "administrator", "creator") or (
+                    member.status == "restricted" and getattr(member, "is_member", False))
+            except TelegramError as exc:
+                log.warning("Force-join membership check failed for %s: %s",
+                            row["chat_id"], type(exc).__name__)
+                joined = False
+            if not joined:
+                missing.append(row)
+        return missing
+
+    async def force_join_notice(self, msg, missing):
+        rows = []
+        for item in missing:
+            kind = "Channel" if item["chat_type"] == "channel" else "Group"
+            rows.append([InlineKeyboardButton(
+                f"➕ Join {kind}: {item['title'][:35]}", url=item["invite_link"])])
+        rows.append([InlineKeyboardButton("✅ I Joined — Verify", callback_data="fj:check")])
+        await self.reply(
+            msg,
+            escape("🔐 FORCE JOIN REQUIRED\n\nJoin every channel/group below first, "
+                   "then tap “I Joined — Verify”."),
+            reply_markup=InlineKeyboardMarkup(rows))
+
+    async def show_force_join(self, msg, uid):
+        if uid != self.owner_id:
+            await self.say(msg, "🚫 Only the owner can manage force-join chats.")
+            return
+        records = self.store.force_join_chats()
+        lines = ["🔐 FORCE JOIN", "", f"Required chats: {len(records)}"]
+        for item in records:
+            username = f"@{item['username']}" if item["username"] else "Private invite"
+            lines += ["", item["title"][:80], f"ID: {item['chat_id']}", username]
+        if not records:
+            lines += ["", "No force-join chat is configured."]
+        rows = [
+            [("➕ Add Chat", "forcejoin_add"), ("➖ Remove Chat", "forcejoin_remove")],
+            [("⬅ Admin Panel", "panel")],
+        ]
+        await self.say(msg, "\n".join(lines), keyboard(rows), category="forcejoin")
+
+    async def prompt_force_join(self, msg, uid, action):
+        if uid != self.owner_id:
+            await self.say(msg, "🚫 Only the owner can manage force-join chats.")
+            return
+        self.put_state(msg, uid, kind="input", action=action)
+        if action == "forcejoin_add":
+            text = (
+                "➕ ADD FORCE-JOIN CHAT\n\n"
+                "Public chat:\n!addforcejoin @username\n\n"
+                "Private chat:\n!addforcejoin -1001234567890 https://t.me/+invite\n\n"
+                "The bot must already be an administrator in that channel/group.\n"
+                "!cancel stops this action."
+            )
+        else:
+            text = (
+                "➖ REMOVE FORCE-JOIN CHAT\n\n"
+                "Send its numeric chat ID or public @username.\n"
+                "Example: !removeforcejoin @username\n\n"
+                "!cancel stops this action."
+            )
+        await self.say(msg, text, CANCEL, category="forcejoin")
+
+    async def add_force_join(self, msg, uid, text, ctx):
+        if uid != self.owner_id:
+            await self.say(msg, "🚫 Only the owner can manage force-join chats.")
+            return
+        parts = text.split(maxsplit=1)
+        target = parts[0]
+        supplied_link = parts[1].strip() if len(parts) == 2 else ""
+        if not (re.fullmatch(r"-100[0-9]{5,16}", target) or
+                re.fullmatch(r"@[A-Za-z0-9_]{5,32}", target)):
+            await self.say(msg, "Send a public @username, or a -100… chat ID followed by its invite link.", CANCEL)
+            return
+        try:
+            chat = await ctx.bot.get_chat(int(target) if target.startswith("-100") else target)
+            if chat.type not in ("group", "supergroup", "channel"):
+                raise ValueError("unsupported chat type")
+            bot_member = await ctx.bot.get_chat_member(chat.id, ctx.bot.id)
+            if bot_member.status not in ("administrator", "creator"):
+                await self.say(msg, "Make the bot an administrator in that channel/group first.", CANCEL)
+                return
+        except (TelegramError, ValueError) as exc:
+            log.warning("Could not add force-join chat %s: %s", target, type(exc).__name__)
+            await self.say(msg, "Telegram could not verify that chat. Check the ID/username and make the bot an administrator there.", CANCEL)
+            return
+        username = getattr(chat, "username", None)
+        link = f"https://t.me/{username}" if username else supplied_link
+        if not re.fullmatch(r"https://t\.me/(?:\+[A-Za-z0-9_-]+|joinchat/[A-Za-z0-9_-]+)", link or "") and not username:
+            await self.say(msg, "A private chat needs a valid https://t.me/+… invite link.", CANCEL)
+            return
+        self.store.execute("""
+            INSERT INTO force_join_chats
+                (chat_id,title,username,invite_link,chat_type,added_by,added_at)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,
+                username=excluded.username,invite_link=excluded.invite_link,
+                chat_type=excluded.chat_type,added_by=excluded.added_by,
+                added_at=excluded.added_at
+        """, (chat.id, chat.title or username or str(chat.id), username, link,
+              chat.type, uid, time.time()))
+        self.pending.pop((uid, msg.chat.id), None)
+        await self.say(msg, f"✅ Force join enabled for:\n{chat.title or username}\nID: {chat.id}",
+                       category="forcejoin")
+
+    async def remove_force_join(self, msg, uid, text):
+        if uid != self.owner_id:
+            await self.say(msg, "🚫 Only the owner can manage force-join chats.")
+            return
+        target = text.strip()
+        if re.fullmatch(r"-100[0-9]{5,16}", target):
+            where, value = "chat_id=?", int(target)
+        elif re.fullmatch(r"@[A-Za-z0-9_]{5,32}", target):
+            where, value = "LOWER(username)=?", target[1:].lower()
+        else:
+            await self.say(msg, "Send one configured -100… chat ID or public @username.", CANCEL)
+            return
+        found = self.store.scalar(f"SELECT COUNT(*) FROM force_join_chats WHERE {where}", (value,))
+        if not found:
+            await self.say(msg, "That chat is not in the force-join list.", category="forcejoin")
+            return
+        self.store.execute(f"DELETE FROM force_join_chats WHERE {where}", (value,))
+        self.pending.pop((uid, msg.chat.id), None)
+        await self.say(msg, f"✅ Force join removed for {target}.", category="forcejoin")
+
     async def show(self, msg, uid, action, page):
         self.pending.pop((uid, msg.chat.id), None)
         if action == "stats":
@@ -402,6 +573,7 @@ class AdminPanel:
                 "Banned IDs": s.scalar("SELECT COUNT(*) FROM bans"),
                 "Admins (incl. owner)": s.scalar("SELECT COUNT(*) FROM admins WHERE user_id!=?", (self.owner_id,))+1,
                 "Tracked active groups": s.scalar("SELECT COUNT(*) FROM groups_seen WHERE active=1"),
+                "Force-join chats": s.scalar("SELECT COUNT(*) FROM force_join_chats"),
             }
             await self.say(msg, "📊 BOT STATS\n\n" + "\n".join(f"{k}: {v}" for k,v in values.items()) +
                            "\n\nCounts begin when this module is installed.\n"
