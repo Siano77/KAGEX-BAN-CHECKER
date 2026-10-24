@@ -12,7 +12,6 @@ import secrets
 import sqlite3
 import time
 from html import escape
-from datetime import datetime, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import Forbidden, RetryAfter, TelegramError
@@ -56,11 +55,6 @@ class Store:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript("""
-                CREATE TABLE IF NOT EXISTS activity_totals (
-                    day_utc TEXT NOT NULL, kind TEXT NOT NULL,
-                    total INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY(day_utc, kind)
-                );
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY, name TEXT NOT NULL,
                     username TEXT, first_seen REAL NOT NULL, last_seen REAL NOT NULL,
@@ -149,19 +143,6 @@ class Store:
                 AND user_id NOT IN (SELECT user_id FROM bans)
             ORDER BY user_id
         """)
-
-    def count_activity(self, kind):
-        """Anonymous daily counts only: never store messages or checked numbers."""
-        if kind not in ("interactions", "check_requests"):
-            raise ValueError("Unknown activity counter")
-        day = datetime.now(timezone.utc).date().isoformat()
-        self.execute("""INSERT INTO activity_totals(day_utc,kind,total) VALUES(?,?,1)
-            ON CONFLICT(day_utc,kind) DO UPDATE SET total=total+1""", (day, kind))
-
-    def activity_total(self, kind, day=None):
-        if day is None:
-            return self.scalar("SELECT COALESCE(SUM(total),0) FROM activity_totals WHERE kind=?", (kind,))
-        return self.scalar("SELECT COALESCE(SUM(total),0) FROM activity_totals WHERE kind=? AND day_utc=?", (kind,day))
 
     def force_join_chats(self):
         return self.rows("SELECT * FROM force_join_chats ORDER BY added_at, chat_id")
@@ -314,8 +295,6 @@ class AdminPanel:
         interacting = private or query is not None or text.startswith(("!", "/"))
         if interacting:
             self.store.track_user(user, chat.id if private else None)
-            if not user.is_bot:
-                self.store.count_activity("interactions")
 
         if user.id != self.owner_id and self.store.banned(user.id):
             if query:
@@ -363,17 +342,6 @@ class AdminPanel:
             else:
                 await self.command(msg, user.id, cmd, args, ctx)
             raise ApplicationHandlerStop
-
-        # Count only text check commands that reach the existing bot handlers.
-        # This is a request count, not completed checks or a count of numbers.
-        if not query and msg.text:
-            parts = msg.text.strip().split(None, 1)
-            token = parts[0] if parts else ""
-            slash_check = re.fullmatch(r"/check(?:@([a-z0-9_]+))?", token, re.I)
-            addressed_here = slash_check and (not slash_check[1] or
-                slash_check[1].lower() == (ctx.bot.username or "").lower())
-            if token.lower() == "!check" or addressed_here:
-                self.store.count_activity("check_requests")
 
         if state and private:
             if not self.is_admin(user.id):
@@ -599,9 +567,6 @@ class AdminPanel:
         if action == "stats":
             s = self.store
             values = {
-                "Received interactions": s.activity_total("interactions"),
-                "Interactions today (UTC)": s.activity_total("interactions", datetime.now(timezone.utc).date().isoformat()),
-                "Check requests": s.activity_total("check_requests"),
                 "Users tracked": s.scalar("SELECT COUNT(*) FROM users"),
                 "Active in last 24h": s.scalar("SELECT COUNT(*) FROM users WHERE last_seen>=?", (time.time()-86400,)),
                 "Broadcast audience": len(s.recipients()),
@@ -612,9 +577,6 @@ class AdminPanel:
             }
             await self.say(msg, "📊 BOT STATS\n\n" + "\n".join(f"{k}: {v}" for k,v in values.items()) +
                            "\n\nCounts begin when this module is installed.\n"
-                           "Activity totals start with the database update.\n"
-                           "Check requests include invalid inputs, not completed results.\n"
-                           "Checked numbers and message text are not saved in this database.\n"
                            "These are local counts, not Telegram's monthly-user badge.", category="stats")
         elif action == "uptime":
             seconds = int(time.monotonic()-self.started)
