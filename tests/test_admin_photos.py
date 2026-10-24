@@ -41,14 +41,14 @@ class PhotoTests(unittest.IsolatedAsyncioTestCase):
             await self.panel.middleware(obj,self.ctx)
         return obj.effective_message
 
-    async def test_all_eleven_photo_commands_work_from_photo_captions(self):
-        self.assertEqual(len(PHOTO_COMMANDS),11)
+    async def test_all_twelve_photo_commands_work_from_photo_captions(self):
+        self.assertEqual(len(PHOTO_COMMANDS),12)
         for command, category in PHOTO_COMMANDS.items():
             obj=event(text=None,caption='!'+command,photo_ids=('thumbnail','full-'+category))
             msg=await self.route(obj)
             self.assertEqual(self.panel.store.get_photo(category),'full-'+category)
             self.assertEqual(msg.reply_photo.call_args.kwargs['photo'],'full-'+category)
-        self.assertEqual(self.panel.store.scalar('SELECT COUNT(*) FROM admin_photos'),11)
+        self.assertEqual(self.panel.store.scalar('SELECT COUNT(*) FROM admin_photos'),12)
 
     async def test_owner_only_even_for_existing_admins(self):
         for uid in (USER,ADMIN):
@@ -99,7 +99,8 @@ class PhotoTests(unittest.IsolatedAsyncioTestCase):
             self.panel.store.set_photo(cat,'pic-'+cat)
         commands={'panel':'!admin','stats':'!stats','uptime':'!uptime','users':'!users',
                   'groups':'!groups','admins':'!admins','ban':'!ban','unban':'!unban',
-                  'add':'!addadmin','remove':'!removeadmin','broadcast':'!broadcast'}
+                  'add':'!addadmin','remove':'!removeadmin','broadcast':'!broadcast',
+                  'forcejoin':'!forcejoin'}
         for cat,command in commands.items():
             obj=event(text=command)
             msg=await self.route(obj)
